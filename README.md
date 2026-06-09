@@ -16,6 +16,8 @@ That's it. Usage is logged automatically from that point on.
 
 > The installer finds your Python interpreter, copies hook scripts to `~/.claude/hooks/`, registers them in `~/.claude/settings.json`, creates the database, and runs a smoke test. Any existing hooks are left in place.
 
+<img width="3679" height="1912" alt="image" src="https://github.com/user-attachments/assets/57220cd7-8097-4d57-ab61-546ab50af504" />
+
 ## Dashboard Features
 
 ### KPIs
