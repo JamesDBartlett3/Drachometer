@@ -2,7 +2,7 @@
 
 ![Coin logo](coin.svg)
 
-A Claude Code hook that automatically logs every turn and tool call to a local SQLite database, with a browser-based dashboard for exploring costs, token usage, and cache efficiency.
+A Claude Code hook that logs every turn and tool call to a local SQLite database, with a browser dashboard for exploring token usage, costs, and cache efficiency. Features model-aware pricing, multi-sort tables, date filtering, live SSE refresh, and rich charts. No API keys or external services. 
 
 ![Dashboard](https://img.shields.io/badge/dashboard-localhost:9873-c87533)
 
