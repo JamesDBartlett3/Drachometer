@@ -39,6 +39,12 @@
   header img.coin-logo { height: 28px; width: 28px; flex-shrink: 0; }
   header h1 { font-size: 20px; font-weight: 600; white-space: nowrap; }
   header .meta { color: var(--muted); font-size: 13px; }
+  .update-banner {
+    display: none; margin: 12px 32px 0; padding: 10px 12px;
+    border: 1px solid rgba(96,165,250,.4); border-radius: 8px;
+    background: rgba(96,165,250,.12); color: #dbeafe; font-size: 13px;
+  }
+  .update-banner a { color: #bfdbfe; font-weight: 600; }
   #drop-zone {
     display: flex; flex-direction: column; align-items: center; justify-content: center;
     height: 60vh; gap: 16px; color: var(--muted);
@@ -221,6 +227,7 @@
   </div>
   <span id="header-meta" class="meta"></span>
 </header>
+<div id="update-banner" class="update-banner"></div>
 
 <div class="modal-overlay" id="readme-modal">
   <div class="modal">
@@ -1039,6 +1046,57 @@ dropZone.addEventListener('drop', e => {
 // --- Live refresh via SSE ---
 let sqlJs = null;
 
+function semverParts(version) {
+  const text = String(version || '').trim().replace(/^v/i, '');
+  const [major = '0', minor = '0', patch = '0'] = text.split('.');
+  const parse = part => {
+    const m = String(part).match(/^(\d+)/);
+    return m ? parseInt(m[1], 10) : 0;
+  };
+  return [parse(major), parse(minor), parse(patch)];
+}
+
+function isVersionNewer(candidate, current) {
+  const a = semverParts(candidate);
+  const b = semverParts(current);
+  for (let i = 0; i < 3; i++) {
+    if (a[i] > b[i]) return true;
+    if (a[i] < b[i]) return false;
+  }
+  return false;
+}
+
+async function checkForUpdates() {
+  try {
+    const localResp = await fetch('version.json', { cache: 'no-store' });
+    if (!localResp.ok) return;
+    const localMeta = await localResp.json();
+    const currentVersion = localMeta.version || '0.0.0';
+    const releasesApi = localMeta.releases_api;
+    if (!releasesApi) return;
+
+    const releaseResp = await fetch(releasesApi, {
+      cache: 'no-store',
+      headers: { 'Accept': 'application/vnd.github+json' }
+    });
+    if (!releaseResp.ok) return;
+    const release = await releaseResp.json();
+    const latestVersion = (release.tag_name || '').replace(/^v/i, '');
+    if (!latestVersion || !isVersionNewer(latestVersion, currentVersion)) return;
+
+    const banner = document.getElementById('update-banner');
+    const latestUrl = release.html_url || localMeta.releases_url || '#';
+    banner.textContent = `Update available: v${latestVersion} (installed v${currentVersion}). `;
+    const link = document.createElement('a');
+    link.href = latestUrl;
+    link.target = '_blank';
+    link.rel = 'noopener noreferrer';
+    link.textContent = 'View latest release';
+    banner.appendChild(link);
+    banner.style.display = 'block';
+  } catch {}
+}
+
 async function reloadDb() {
   try {
     const resp = await fetch('token_usage.db');
@@ -1141,6 +1199,7 @@ document.addEventListener('keydown', e => { if (e.key === 'Escape' && readmeModa
 
 // --- Init ---
 restoreSlicer();
+checkForUpdates();
 
 (async () => {
   try {

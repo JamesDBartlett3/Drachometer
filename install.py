@@ -21,6 +21,7 @@ CLAUDE_DIR = Path.home() / ".claude"
 HOOKS_DIR = CLAUDE_DIR / "hooks"
 SETTINGS_PATH = CLAUDE_DIR / "settings.json"
 DB_PATH = CLAUDE_DIR / "token_usage.db"
+VERSION_PATH = HOOKS_DIR / "version.json"
 
 REPO_HOOKS = Path(__file__).resolve().parent / "hooks"
 REPO_REPORT = Path(__file__).resolve().parent / "report.html"
@@ -28,6 +29,10 @@ REPO_SERVER = Path(__file__).resolve().parent / "serve_report.py"
 
 REPO_README = Path(__file__).resolve().parent / "README.md"
 REPO_COIN = Path(__file__).resolve().parent / "coin.svg"
+REPO_VERSION = Path(__file__).resolve().parent / "version.json"
+
+APP_METADATA = json.loads(REPO_VERSION.read_text(encoding="utf-8"))
+APP_VERSION = str(APP_METADATA.get("version", "0.0.0"))
 
 HOOK_FILES = {
     "log_usage.py": REPO_HOOKS / "log_usage.py",
@@ -35,6 +40,7 @@ HOOK_FILES = {
     "report.html": REPO_REPORT,
     "README.md": REPO_README,
     "coin.svg": REPO_COIN,
+    "version.json": REPO_VERSION,
 }
 
 MODEL_TIER_PRICING = {
@@ -42,6 +48,100 @@ MODEL_TIER_PRICING = {
     "sonnet": {"input": 3.0,  "output": 15.0, "cache_read": 0.30, "cache_create": 3.75},
     "haiku":  {"input": 0.8,  "output": 4.0,  "cache_read": 0.08, "cache_create": 1.0},
 }
+
+
+def semver_key(version: str | None) -> tuple[int, int, int]:
+    text = str(version or "").strip().lstrip("v")
+    parts = text.split(".")
+    nums: list[int] = []
+    for idx in range(3):
+        if idx >= len(parts):
+            nums.append(0)
+            continue
+        match = re.match(r"^(\d+)", parts[idx])
+        nums.append(int(match.group(1)) if match else 0)
+    return (nums[0], nums[1], nums[2])
+
+
+def detect_installed_version() -> str:
+    if VERSION_PATH.exists():
+        try:
+            data = json.loads(VERSION_PATH.read_text(encoding="utf-8"))
+            return str(data.get("version", "0.0.0"))
+        except (OSError, json.JSONDecodeError, ValueError):
+            pass
+    return "0.0.0"
+
+
+def migrate_legacy_db_paths() -> bool:
+    if DB_PATH.exists():
+        return False
+    candidates = [
+        CLAUDE_DIR / "claude_token_usage.db",
+        CLAUDE_DIR / "claude-code-token-usage.db",
+        HOOKS_DIR / "token_usage.db",
+    ]
+    for src in candidates:
+        if src.exists():
+            src.replace(DB_PATH)
+            print(f"  Migrated database path: {src} -> {DB_PATH}")
+            return True
+    return False
+
+
+def migrate_settings_for_server_changes() -> bool:
+    if not SETTINGS_PATH.exists():
+        return False
+    try:
+        settings = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, ValueError):
+        return False
+    hooks = settings.get("hooks")
+    if not isinstance(hooks, dict):
+        return False
+
+    changed = False
+    for event, groups in list(hooks.items()):
+        if not isinstance(groups, list):
+            continue
+        new_groups = []
+        for group in groups:
+            hook_defs = group.get("hooks", []) if isinstance(group, dict) else []
+            if not isinstance(hook_defs, list):
+                continue
+            filtered = []
+            for hook in hook_defs:
+                command = hook.get("command", "") if isinstance(hook, dict) else ""
+                if "serve_report.py" in command:
+                    changed = True
+                    continue
+                filtered.append(hook)
+            if filtered:
+                if len(filtered) != len(hook_defs):
+                    changed = True
+                if isinstance(group, dict):
+                    group = dict(group)
+                    group["hooks"] = filtered
+                new_groups.append(group)
+            else:
+                changed = True
+        hooks[event] = new_groups
+
+    if changed:
+        SETTINGS_PATH.write_text(
+            json.dumps(settings, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        print("  Migrated hook settings for HTTP server behavior")
+    return changed
+
+
+def run_install_migrations(installed_version: str) -> None:
+    if semver_key(installed_version) >= semver_key(APP_VERSION):
+        return
+    print(f"  Found installed version {installed_version}; migrating to {APP_VERSION}")
+    migrate_legacy_db_paths()
+    migrate_settings_for_server_changes()
 
 
 def infer_model_attributes(model_key: str | None) -> dict:
@@ -328,20 +428,24 @@ def main() -> None:
     print("claude-token-logger installer")
     print("=" * 40)
 
-    print("\n[1/5] Finding Python...")
+    print("\n[1/6] Finding Python...")
     python_exe = find_python()
     print(f"  Using: {python_exe}")
 
-    print("\n[2/5] Copying hook files...")
+    print("\n[2/6] Detecting installed version and running migrations...")
+    installed_version = detect_installed_version()
+    run_install_migrations(installed_version)
+
+    print("\n[3/6] Copying hook files...")
     copy_hooks(python_exe)
 
-    print("\n[3/5] Updating settings.json...")
+    print("\n[4/6] Updating settings.json...")
     merge_settings(python_exe)
 
-    print("\n[4/5] Initializing database...")
+    print("\n[5/6] Initializing database...")
     init_database()
 
-    print("\n[5/5] Running smoke test...")
+    print("\n[6/6] Running smoke test...")
     if smoke_test(python_exe):
         print("  PASS")
     else:
@@ -358,6 +462,7 @@ def main() -> None:
     print("  http://localhost:9873/report.html\n")
     print(f"Database: {DB_PATH}")
     print(f"Hooks:    {HOOKS_DIR}")
+    print(f"Version:  {APP_VERSION}")
 
 
 if __name__ == "__main__":

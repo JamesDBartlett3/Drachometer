@@ -1,0 +1,7 @@
+{
+  "name": "claude-code-token-usage-dashboard",
+  "version": "1.0.0",
+  "repository": "JamesDBartlett3/claude-code-token-usage-dashboard",
+  "releases_api": "https://api.github.com/repos/JamesDBartlett3/claude-code-token-usage-dashboard/releases/latest",
+  "releases_url": "https://github.com/JamesDBartlett3/claude-code-token-usage-dashboard/releases/latest"
+}
