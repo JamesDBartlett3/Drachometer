@@ -38,8 +38,8 @@ Implemented network-install bootstrap scripts for Windows PowerShell and Bash so
    - Result: PASS
 
 ### Security/quality checks
-- Secret scan on changed files: pending at time of writing; completed before finalization.
-- CodeQL check: pending at time of writing; completed before finalization.
+- Secret scan on changed files: PASS
+- CodeQL check: no analyzable code changes detected for supported CodeQL languages
 
 ## Notes
 - The new scripts intentionally keep `install.py` as the single source of truth for copying files, merging Claude hook settings, initializing the database, and running the smoke test.
