@@ -81,6 +81,32 @@ The installer registers two Claude Code hooks:
 On first run, the hook also starts a lightweight HTTP server (port 9873) that serves the dashboard and reads directly from the live database.
 When the installer finds models with missing metadata during migration, it prompts for any missing name/version/provider/pricing values.
 
+## Future Upgrade: Lossless Schema Migration
+
+If a future release needs to migrate older databases to the model-dimension schema (`turns.model_id -> models.id`), run:
+
+`migrations/001_migrate_to_model_dimension.sql`
+
+That script performs the full lossless migration by doing the following in one transaction:
+
+1. Creates `models` if it does not exist.
+2. Adds `turns.model_id` as a foreign key to `models(id)`.
+3. Inserts one `models` row per distinct non-empty legacy `turns.model` value.
+4. Backfills `turns.model_id` by joining legacy `turns.model` values to `models.model_key`.
+5. Creates `idx_turns_model_id` for query performance.
+
+Recommended upgrade procedure:
+
+1. Stop Claude Code so no writes occur during migration.
+2. Back up the database:
+   - `cp ~/.claude/token_usage.db ~/.claude/token_usage.db.bak`
+3. Run the migration script:
+   - `sqlite3 ~/.claude/token_usage.db < migrations/001_migrate_to_model_dimension.sql`
+4. Verify migration results:
+   - `SELECT COUNT(*) FROM turns WHERE model IS NOT NULL AND TRIM(model) <> '' AND model_id IS NULL;` (should be `0`)
+   - `SELECT COUNT(*) FROM turns t LEFT JOIN models m ON m.id = t.model_id WHERE t.model_id IS NOT NULL AND m.id IS NULL;` (should be `0`)
+5. Start Claude Code again.
+
 ## Data Retention
 
 You can automatically purge old records by setting a retention window (in days):
