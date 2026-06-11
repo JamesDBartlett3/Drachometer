@@ -368,6 +368,42 @@ function query(sql) {
   });
 }
 
+function columnExists(table, column) {
+  try {
+    const cols = query(`PRAGMA table_info(${table})`);
+    return cols.some(c => c.name === column);
+  } catch {
+    return false;
+  }
+}
+
+function ensureDbSchema() {
+  DB.run(`CREATE TABLE IF NOT EXISTS models (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    model_key TEXT NOT NULL UNIQUE,
+    model_name TEXT,
+    model_version TEXT,
+    model_provider TEXT,
+    input_price_per_mtok REAL,
+    output_price_per_mtok REAL,
+    cache_read_price_per_mtok REAL,
+    cache_creation_price_per_mtok REAL
+  )`);
+  if (!columnExists('turns', 'model_id')) {
+    DB.run('ALTER TABLE turns ADD COLUMN model_id INTEGER');
+  }
+  if (columnExists('turns', 'model')) {
+    DB.run(`INSERT OR IGNORE INTO models (model_key)
+            SELECT DISTINCT model FROM turns
+            WHERE model IS NOT NULL AND TRIM(model) <> ''`);
+    DB.run(`UPDATE turns
+            SET model_id = (
+              SELECT m.id FROM models m WHERE m.model_key = turns.model
+            )
+            WHERE model_id IS NULL AND model IS NOT NULL AND TRIM(model) <> ''`);
+  }
+}
+
 function esc(s) {
   if (!s) return '';
   return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
@@ -389,7 +425,12 @@ function fmt(n) {
 function usd(n) { return '$' + (n || 0).toFixed(2); }
 
 function costOf(row) {
-  const p = pricingFor(row.model);
+  const p = {
+    input: row.input_price_per_mtok ?? pricingFor(row.model).input,
+    output: row.output_price_per_mtok ?? pricingFor(row.model).output,
+    cacheRead: row.cache_read_price_per_mtok ?? pricingFor(row.model).cacheRead,
+    cacheCreate: row.cache_creation_price_per_mtok ?? pricingFor(row.model).cacheCreate,
+  };
   return ((row.input_tokens || 0) * p.input
     + (row.output_tokens || 0) * p.output
     + (row.cache_read_tokens || 0) * p.cacheRead
@@ -549,6 +590,7 @@ function render() {
   chartDefaults();
 
   const tw = turnsWhere();
+  const twt = turnsWhere().replaceAll('recorded_at', 't.recorded_at');
 
   const totals = query(`
     SELECT COUNT(*) as turns,
@@ -563,9 +605,14 @@ function render() {
 
   // Per-row cost using each row's own model
   const allTurns = query(`
-    SELECT input_tokens, output_tokens, cache_read_tokens,
-           cache_creation_tokens, model
-    FROM turns ${tw}`);
+    SELECT t.input_tokens, t.output_tokens, t.cache_read_tokens,
+           t.cache_creation_tokens,
+           COALESCE(m.model_key, t.model) as model,
+           m.input_price_per_mtok, m.output_price_per_mtok,
+           m.cache_read_price_per_mtok, m.cache_creation_price_per_mtok
+    FROM turns t
+    LEFT JOIN models m ON m.id = t.model_id
+    ${twt}`);
   const totalCost = allTurns.reduce((sum, r) => sum + costOf(r), 0);
 
   const totalInput = (totals.input_tokens || 0) + (totals.cache_read_tokens || 0) + (totals.cache_creation_tokens || 0);
@@ -605,10 +652,15 @@ function render() {
 
   // Daily cost breakdown chart (dollars per cost category)
   const dailyRows = query(`
-    SELECT recorded_at, model,
-           input_tokens, output_tokens,
-           cache_read_tokens, cache_creation_tokens
-    FROM turns ${tw} ORDER BY recorded_at`);
+    SELECT t.recorded_at,
+           COALESCE(m.model_key, t.model) as model,
+           t.input_tokens, t.output_tokens,
+           t.cache_read_tokens, t.cache_creation_tokens,
+           m.input_price_per_mtok, m.output_price_per_mtok,
+           m.cache_read_price_per_mtok, m.cache_creation_price_per_mtok
+    FROM turns t
+    LEFT JOIN models m ON m.id = t.model_id
+    ${twt} ORDER BY t.recorded_at`);
   const singleDay = isSingleDay();
   dailyRows.forEach(r => {
     r.day = localDate(r.recorded_at);
@@ -866,18 +918,20 @@ function render() {
 
   // Sessions table
   const sessions = query(`
-    SELECT session_id,
-           MIN(recorded_at) as first_turn,
-           MAX(recorded_at) as last_turn,
+    SELECT t.session_id,
+           MIN(t.recorded_at) as first_turn,
+           MAX(t.recorded_at) as last_turn,
            COUNT(*) as turns,
-           SUM(input_tokens) as input_tokens,
-           SUM(output_tokens) as output_tokens,
-           SUM(cache_read_tokens) as cache_read_tokens,
-           SUM(cache_creation_tokens) as cache_creation_tokens,
-           MAX(cwd) as cwd,
-           MAX(git_branch) as git_branch,
-           MAX(model) as model
-    FROM turns ${tw} GROUP BY session_id ORDER BY first_turn DESC`);
+           SUM(t.input_tokens) as input_tokens,
+           SUM(t.output_tokens) as output_tokens,
+           SUM(t.cache_read_tokens) as cache_read_tokens,
+           SUM(t.cache_creation_tokens) as cache_creation_tokens,
+           MAX(t.cwd) as cwd,
+           MAX(t.git_branch) as git_branch,
+           MAX(COALESCE(m.model_key, t.model)) as model
+    FROM turns t
+    LEFT JOIN models m ON m.id = t.model_id
+    ${twt} GROUP BY t.session_id ORDER BY first_turn DESC`);
   sessions.forEach(s => s._cost = costOf(s));
   lastSessionData = sessions;
   renderSessionTable();
@@ -886,10 +940,15 @@ function render() {
   const turns = query(`
     SELECT t.session_id, t.turn_id, t.recorded_at, t.stop_reason,
            t.input_tokens, t.output_tokens, t.cache_read_tokens,
-           t.cache_creation_tokens, t.cwd, t.git_branch, t.model,
+           t.cache_creation_tokens, t.cwd, t.git_branch,
+           COALESCE(m.model_key, t.model) as model,
+           m.input_price_per_mtok, m.output_price_per_mtok,
+           m.cache_read_price_per_mtok, m.cache_creation_price_per_mtok,
            COUNT(tc.id) as tool_calls,
            GROUP_CONCAT(tc.tool_name, ', ') as tools_used
-    FROM turns t LEFT JOIN tool_calls tc ON tc.turn_pk = t.id
+    FROM turns t
+    LEFT JOIN models m ON m.id = t.model_id
+    LEFT JOIN tool_calls tc ON tc.turn_pk = t.id
     ${turnsWhere().replaceAll('recorded_at', 't.recorded_at')}
     GROUP BY t.id ORDER BY t.recorded_at DESC LIMIT 50`);
   turns.forEach(t => t._cost = costOf(t));
@@ -901,6 +960,7 @@ async function loadDb(arrayBuffer) {
   if (!sqlJs) sqlJs = await initSqlJs({ locateFile: f => `https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.12.0/${f}` });
   if (DB) DB.close();
   DB = new sqlJs.Database(new Uint8Array(arrayBuffer));
+  ensureDbSchema();
   document.getElementById('drop-zone').style.display = 'none';
   document.getElementById('dashboard').style.display = 'block';
   render();

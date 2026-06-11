@@ -52,7 +52,7 @@ That's it. Usage is logged automatically from that point on.
 
 Each **turn** (one assistant response) records:
 - Token counts: uncached input, output, cache read, cache creation
-- Model (e.g. `claude-opus-4-20250115`)
+- Model relationship (`model_id`) to the `models` dimension table
 - Working directory and git branch
 - Stop reason
 - Timestamp (UTC)
@@ -64,14 +64,22 @@ Each **tool call** records:
 
 All data is extracted from Claude Code's transcript files — no API keys or external services required.
 
+Each **model** row in the dimension table stores:
+- Model key from transcript data (e.g. `claude-opus-4-20250115`)
+- Model name
+- Model version
+- Model provider
+- Token pricing (input, output, cache read, cache creation)
+
 ## How It Works
 
 The installer registers two Claude Code hooks:
 
-- **Stop** — fires after each assistant turn. Reads the transcript file to extract token usage, model, and stop reason. Writes a row to the `turns` table.
+- **Stop** — fires after each assistant turn. Reads the transcript file to extract token usage, model, and stop reason. Upserts model metadata into the `models` table, then writes the turn row.
 - **PostToolUse** — fires after each tool call. Writes a row to the `tool_calls` table.
 
 On first run, the hook also starts a lightweight HTTP server (port 9873) that serves the dashboard and reads directly from the live database.
+When the installer finds models with missing metadata during migration, it prompts for any missing name/version/provider/pricing values.
 
 ## Data Retention
 

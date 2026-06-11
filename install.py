@@ -10,6 +10,7 @@ Usage:
 """
 
 import json
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -35,6 +36,114 @@ HOOK_FILES = {
     "README.md": REPO_README,
     "coin.svg": REPO_COIN,
 }
+
+MODEL_TIER_PRICING = {
+    "opus":   {"input": 15.0, "output": 75.0, "cache_read": 1.50, "cache_create": 18.75},
+    "sonnet": {"input": 3.0,  "output": 15.0, "cache_read": 0.30, "cache_create": 3.75},
+    "haiku":  {"input": 0.8,  "output": 4.0,  "cache_read": 0.08, "cache_create": 1.0},
+}
+
+
+def infer_model_attributes(model_key: str | None) -> dict:
+    key = (model_key or "").strip()
+    lower = key.lower()
+
+    if "opus" in lower:
+        tier = "opus"
+    elif "sonnet" in lower:
+        tier = "sonnet"
+    elif "haiku" in lower:
+        tier = "haiku"
+    else:
+        tier = None
+
+    parts = [p for p in key.split("-") if p]
+    model_name = " ".join(parts[:2]).title() if len(parts) >= 2 and parts[0].lower() == "claude" else (parts[0].title() if parts else None)
+    version_match = re.search(r"(\d+(?:[-.]\d+)*(?:-\d{8})?)", key)
+    model_version = version_match.group(1) if version_match else None
+    provider = "Anthropic" if lower.startswith("claude-") or lower.startswith("claude") else None
+
+    pricing = MODEL_TIER_PRICING.get(tier, {})
+    return {
+        "model_name": model_name,
+        "model_version": model_version,
+        "model_provider": provider,
+        "input_price_per_mtok": pricing.get("input"),
+        "output_price_per_mtok": pricing.get("output"),
+        "cache_read_price_per_mtok": pricing.get("cache_read"),
+        "cache_creation_price_per_mtok": pricing.get("cache_create"),
+    }
+
+
+def prompt_missing_model_attributes(model_key: str, attrs: dict) -> dict:
+    if not sys.stdin.isatty():
+        return attrs
+
+    print(f"\nModel metadata needed for: {model_key}")
+    labels = {
+        "model_name": "Model name",
+        "model_version": "Model version",
+        "model_provider": "Model provider",
+        "input_price_per_mtok": "Input token price per 1M",
+        "output_price_per_mtok": "Output token price per 1M",
+        "cache_read_price_per_mtok": "Cache-read token price per 1M",
+        "cache_creation_price_per_mtok": "Cache-creation token price per 1M",
+    }
+    numeric_keys = {
+        "input_price_per_mtok",
+        "output_price_per_mtok",
+        "cache_read_price_per_mtok",
+        "cache_creation_price_per_mtok",
+    }
+    for key, label in labels.items():
+        if attrs.get(key) is not None:
+            continue
+        value = input(f"  {label}: ").strip()
+        if not value:
+            continue
+        if key in numeric_keys:
+            try:
+                attrs[key] = float(value)
+            except ValueError:
+                pass
+        else:
+            attrs[key] = value
+    return attrs
+
+
+def ensure_model_row(conn: sqlite3.Connection, model_key: str, prompt_if_missing: bool) -> int:
+    row = conn.execute("SELECT id FROM models WHERE model_key = ?", (model_key,)).fetchone()
+    if row:
+        return row[0]
+
+    attrs = infer_model_attributes(model_key)
+    if prompt_if_missing:
+        attrs = prompt_missing_model_attributes(model_key, attrs)
+
+    cur = conn.execute(
+        """
+        INSERT INTO models (
+            model_key, model_name, model_version, model_provider,
+            input_price_per_mtok, output_price_per_mtok,
+            cache_read_price_per_mtok, cache_creation_price_per_mtok
+        ) VALUES (
+            :model_key, :model_name, :model_version, :model_provider,
+            :input_price_per_mtok, :output_price_per_mtok,
+            :cache_read_price_per_mtok, :cache_creation_price_per_mtok
+        )
+        """,
+        {"model_key": model_key, **attrs},
+    )
+    return cur.lastrowid
+
+
+def backfill_model_dimension(conn: sqlite3.Connection, prompt_if_missing: bool) -> None:
+    rows = conn.execute(
+        "SELECT id, model FROM turns WHERE model_id IS NULL AND model IS NOT NULL AND TRIM(model) <> ''"
+    ).fetchall()
+    for turn_pk, model_key in rows:
+        model_id = ensure_model_row(conn, model_key, prompt_if_missing=prompt_if_missing)
+        conn.execute("UPDATE turns SET model_id = ? WHERE id = ?", (model_id, turn_pk))
 
 
 def find_python() -> str:
@@ -138,6 +247,18 @@ def merge_settings(python_exe: str) -> None:
 def init_database() -> None:
     with sqlite3.connect(DB_PATH) as conn:
         conn.executescript("""
+            CREATE TABLE IF NOT EXISTS models (
+                id                           INTEGER PRIMARY KEY AUTOINCREMENT,
+                model_key                    TEXT    NOT NULL UNIQUE,
+                model_name                   TEXT,
+                model_version                TEXT,
+                model_provider               TEXT,
+                input_price_per_mtok         REAL,
+                output_price_per_mtok        REAL,
+                cache_read_price_per_mtok    REAL,
+                cache_creation_price_per_mtok REAL
+            );
+
             CREATE TABLE IF NOT EXISTS turns (
                 id                    INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_id            TEXT    NOT NULL,
@@ -148,6 +269,7 @@ def init_database() -> None:
                 output_tokens         INTEGER NOT NULL DEFAULT 0,
                 cache_read_tokens     INTEGER NOT NULL DEFAULT 0,
                 cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+                model_id              INTEGER REFERENCES models(id),
                 UNIQUE(session_id, turn_id)
             );
 
@@ -167,11 +289,13 @@ def init_database() -> None:
             CREATE INDEX IF NOT EXISTS idx_calls_turn_pk ON tool_calls(turn_pk);
             CREATE INDEX IF NOT EXISTS idx_calls_session ON tool_calls(session_id, turn_id);
         """)
-        for col, typedef in [("cwd", "TEXT"), ("git_branch", "TEXT"), ("model", "TEXT")]:
+        for col, typedef in [("cwd", "TEXT"), ("git_branch", "TEXT"), ("model", "TEXT"), ("model_id", "INTEGER REFERENCES models(id)")]:
             try:
                 conn.execute(f"ALTER TABLE turns ADD COLUMN {col} {typedef}")
             except sqlite3.OperationalError:
                 pass
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_turns_model_id ON turns(model_id)")
+        backfill_model_dimension(conn, prompt_if_missing=True)
         conn.commit()
     print(f"  Database ready at {DB_PATH}")
 
