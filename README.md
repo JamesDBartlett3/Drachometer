@@ -18,7 +18,7 @@ irm https://raw.githubusercontent.com/JamesDBartlett3/claude-code-token-usage-da
 curl -fsSL https://raw.githubusercontent.com/JamesDBartlett3/claude-code-token-usage-dashboard/main/install.sh | bash
 ```
 
-These bootstrap scripts download the repository to a temporary directory and then run the existing installer, which finds your Python interpreter, copies hook scripts to `~/.claude/hooks/claude-code-token-usage-dashboard/`, registers them in `~/.claude/settings.json`, creates the database, and runs a smoke test.
+These bootstrap scripts resolve the latest published release via the GitHub Releases API, download the single packaged zip artifact to a temporary directory, extract it, and then run the existing installer. The installer finds your Python interpreter, copies hook scripts to `~/.claude/hooks/claude-code-token-usage-dashboard/`, registers them in `~/.claude/settings.json`, creates the database, and runs a smoke test.
 
 ## Quick Start (Windows zip)
 
@@ -226,6 +226,7 @@ install.bat             # Double-click installer (Windows zip)
 install.ps1             # Network installer bootstrap (Windows PowerShell)
 install.py              # Installer script
 install.sh              # Network installer bootstrap (Mac/Linux/WSL2)
+.github/workflows/release-package.yml # Publishes the release zip asset
 hooks/log_usage.py      # Hook script (Stop + PostToolUse events)
 serve_report.py         # Dashboard server (auto-launched by hook)
 report.html             # Browser dashboard (sql.js + Chart.js)

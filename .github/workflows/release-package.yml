@@ -1,0 +1,37 @@
+name: Release package
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  build-release-zip:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6.0.3
+
+      - name: Build release zip
+        run: |
+          mkdir -p dist
+          zip -r dist/claude-code-token-usage-dashboard.zip \
+            README.md \
+            coin.svg \
+            hooks \
+            install.bat \
+            install.ps1 \
+            install.py \
+            install.sh \
+            migrations \
+            report.html \
+            serve_report.py \
+            version.json
+
+      - name: Upload release zip
+        uses: softprops/action-gh-release@v3.0.0
+        with:
+          files: dist/claude-code-token-usage-dashboard.zip
