@@ -279,13 +279,19 @@
 </div>
 
 <script>
-const MODEL_PRICING = {
-  opus:   { input: 15,   output: 75, cacheRead: 1.50, cacheCreate: 18.75 },
-  sonnet: { input: 3,    output: 15, cacheRead: 0.30, cacheCreate: 3.75 },
-  haiku:  { input: 0.80, output: 4,  cacheRead: 0.08, cacheCreate: 1 },
+// Offline fallback pricing (USD per 1M tokens). Overlaid at startup by
+// loadPricing() from pricing.json (repo-hosted, kept fresh by a GitHub Action).
+let MODEL_PRICING = {
+  opus:   { input: 5, output: 25, cacheRead: 0.50, cacheCreate: 6.25 },
+  sonnet: { input: 3, output: 15, cacheRead: 0.30, cacheCreate: 3.75 },
+  haiku:  { input: 1, output: 5,  cacheRead: 0.10, cacheCreate: 1.25 },
 };
+// Used when a turn's model matches no known tier and no per-row price is stored.
+// Costs as $0 (honest "unknown") rather than silently assuming a tier's price.
+const UNKNOWN_PRICING = { input: 0, output: 0, cacheRead: 0, cacheCreate: 0 };
 
 const MODEL_COLORS = {
+  fable:  '#a78bfa',
   opus:   '#c87533',
   sonnet: '#60a5fa',
   haiku:  '#4ade80',
@@ -295,6 +301,7 @@ const MODEL_COLORS = {
 function modelTier(model) {
   if (!model) return 'unknown';
   const m = model.toLowerCase();
+  if (m.includes('fable'))  return 'fable';
   if (m.includes('opus'))   return 'opus';
   if (m.includes('sonnet')) return 'sonnet';
   if (m.includes('haiku'))  return 'haiku';
@@ -302,7 +309,7 @@ function modelTier(model) {
 }
 
 function pricingFor(model) {
-  return MODEL_PRICING[modelTier(model)] || MODEL_PRICING.sonnet;
+  return MODEL_PRICING[modelTier(model)] || UNKNOWN_PRICING;
 }
 
 function shortModel(model) {
@@ -354,12 +361,34 @@ function isSingleDay() {
   return false;
 }
 
+// recorded_at is stored in UTC; charts bucket by local date. To keep filtering
+// consistent with that bucketing, convert local-day boundaries to UTC instants
+// and compare with SQLite datetime() (which normalizes both sides to UTC).
+// This fixes day-boundary off-by-one errors for non-UTC users.
+function localDayStartUTC(localDateStr) {
+  const [y, m, d] = localDateStr.split('-').map(Number);
+  return new Date(y, m - 1, d, 0, 0, 0, 0).toISOString();
+}
+function addDaysLocal(localDateStr, n) {
+  const [y, m, d] = localDateStr.split('-').map(Number);
+  const dt = new Date(y, m - 1, d);
+  dt.setDate(dt.getDate() + n);
+  const yy = dt.getFullYear(), mm = String(dt.getMonth() + 1).padStart(2, '0'), dd = String(dt.getDate()).padStart(2, '0');
+  return `${yy}-${mm}-${dd}`;
+}
+
 function getDateClause(col = 'recorded_at') {
-  if (dateFrom && dateTo) return ` AND DATE(${col}) >= '${dateFrom}' AND DATE(${col}) <= '${dateTo}'`;
-  if (dateFrom) return ` AND DATE(${col}) >= '${dateFrom}'`;
-  if (dateRange === 'all') return '';
-  if (dateRange === 'today') return ` AND DATE(${col}) >= '${todayLocal()}'`;
-  return ` AND DATE(${col}) >= '${daysAgoLocal(parseInt(dateRange))}'`;
+  let startLocal = null, endExclLocal = null;
+  if (dateFrom && dateTo) { startLocal = dateFrom; endExclLocal = addDaysLocal(dateTo, 1); }
+  else if (dateFrom) { startLocal = dateFrom; }
+  else if (dateRange === 'all') { return ''; }
+  else if (dateRange === 'today') { startLocal = todayLocal(); }
+  else { startLocal = daysAgoLocal(parseInt(dateRange)); }
+
+  let clause = '';
+  if (startLocal) clause += ` AND datetime(${col}) >= datetime('${localDayStartUTC(startLocal)}')`;
+  if (endExclLocal) clause += ` AND datetime(${col}) < datetime('${localDayStartUTC(endExclLocal)}')`;
+  return clause;
 }
 
 function turnsWhere() { return 'WHERE 1=1' + getDateClause('recorded_at'); }
@@ -431,13 +460,21 @@ function fmt(n) {
 
 function usd(n) { return '$' + (n || 0).toFixed(2); }
 
-function costOf(row) {
-  const p = {
-    input: row.input_price_per_mtok ?? pricingFor(row.model).input,
-    output: row.output_price_per_mtok ?? pricingFor(row.model).output,
-    cacheRead: row.cache_read_price_per_mtok ?? pricingFor(row.model).cacheRead,
-    cacheCreate: row.cache_creation_price_per_mtok ?? pricingFor(row.model).cacheCreate,
+// Effective per-token pricing for a row: each row's stored model pricing wins,
+// falling back to the row's model tier. Used by costOf and the waterfall so
+// every cost figure on the dashboard is computed from the same prices.
+function effPricing(row) {
+  const t = pricingFor(row.model);
+  return {
+    input: row.input_price_per_mtok ?? t.input,
+    output: row.output_price_per_mtok ?? t.output,
+    cacheRead: row.cache_read_price_per_mtok ?? t.cacheRead,
+    cacheCreate: row.cache_creation_price_per_mtok ?? t.cacheCreate,
   };
+}
+
+function costOf(row) {
+  const p = effPricing(row);
   return ((row.input_tokens || 0) * p.input
     + (row.output_tokens || 0) * p.output
     + (row.cache_read_tokens || 0) * p.cacheRead
@@ -522,7 +559,7 @@ function renderSessionTable() {
       <td class="right">${fmt(s.output_tokens)}</td>
       <td class="right">${fmt(s.cache_read_tokens)}</td>
       <td class="right">${fmt(s.cache_creation_tokens)}</td>
-      <td class="right cost">${usd(costOf(s))}</td>
+      <td class="right cost">${usd(s._cost)}</td>
     </tr>`).join('')}
   </table>`;
   container.querySelector('tr').addEventListener('click', e =>
@@ -610,9 +647,11 @@ function render() {
 
   const toolCount = query(`SELECT COUNT(*) as c FROM tool_calls tc ${toolsWhere()}`)[0]?.c || 0;
 
-  // Per-row cost using each row's own model
+  // Per-row cost using each row's own model. Summed per session here so the
+  // Sessions table prices each turn at its own model (a session that mixed
+  // Opus and Sonnet is costed correctly, not at one model's rate for all tokens).
   const allTurns = query(`
-    SELECT t.input_tokens, t.output_tokens, t.cache_read_tokens,
+    SELECT t.session_id, t.input_tokens, t.output_tokens, t.cache_read_tokens,
            t.cache_creation_tokens,
            COALESCE(m.model_key, t.model) as model,
            m.input_price_per_mtok, m.output_price_per_mtok,
@@ -621,6 +660,8 @@ function render() {
     LEFT JOIN models m ON m.id = t.model_id
     ${twt}`);
   const totalCost = allTurns.reduce((sum, r) => sum + costOf(r), 0);
+  const costBySession = {};
+  allTurns.forEach(r => { costBySession[r.session_id] = (costBySession[r.session_id] || 0) + costOf(r); });
 
   const totalInput = (totals.input_tokens || 0) + (totals.cache_read_tokens || 0) + (totals.cache_creation_tokens || 0);
   const cacheReadTokens = totals.cache_read_tokens || 0;
@@ -677,7 +718,7 @@ function render() {
 
   const dailyCosts = {};
   dailyRows.forEach(r => {
-    const p = pricingFor(r.model);
+    const p = effPricing(r);
     if (!dailyCosts[r.day]) dailyCosts[r.day] = { input: 0, output: 0, cacheRead: 0, cacheCreate: 0 };
     const d = dailyCosts[r.day];
     d.input       += (r.input_tokens || 0) * p.input / 1e6;
@@ -843,15 +884,20 @@ function render() {
     ${toolsWhere()} AND tc.tool_name IS NOT NULL
     GROUP BY tc.tool_name ORDER BY n DESC LIMIT 15`);
 
-  // Build per-tool token sums from distinct turns
+  // Build per-tool token sums and cost from the distinct turns that used each
+  // tool. We pull each contributing turn's own tokens + stored pricing and
+  // reduce with costOf, so the cost respects every turn's actual model rather
+  // than pricing the whole aggregate at one tier.
   const tools = toolCounts.map(tc => {
     const name = tc.tool_name.replace(/'/g, "''");
-    const row = query(`
-      SELECT SUM(t.input_tokens) as input_tokens,
-             SUM(t.output_tokens) as output_tokens,
-             SUM(t.cache_read_tokens) as cache_read_tokens,
-             SUM(t.cache_creation_tokens) as cache_creation_tokens
-      FROM turns t WHERE t.id IN (
+    const turnRows = query(`
+      SELECT t.input_tokens, t.output_tokens, t.cache_read_tokens, t.cache_creation_tokens,
+             COALESCE(m.model_key, t.model) as model,
+             m.input_price_per_mtok, m.output_price_per_mtok,
+             m.cache_read_price_per_mtok, m.cache_creation_price_per_mtok
+      FROM turns t
+      LEFT JOIN models m ON m.id = t.model_id
+      WHERE t.id IN (
         SELECT DISTINCT (
           SELECT sub.id FROM turns sub
           WHERE sub.session_id = tc2.session_id
@@ -862,8 +908,16 @@ function render() {
         ) FROM tool_calls tc2
         ${toolsWhere().replaceAll('tc.recorded_at', 'tc2.recorded_at')}
         AND tc2.tool_name = '${name}'
-      )`)[0] || {};
-    return { ...tc, ...row };
+      )`);
+    const agg = { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_creation_tokens: 0, _cost: 0 };
+    turnRows.forEach(r => {
+      agg.input_tokens += r.input_tokens || 0;
+      agg.output_tokens += r.output_tokens || 0;
+      agg.cache_read_tokens += r.cache_read_tokens || 0;
+      agg.cache_creation_tokens += r.cache_creation_tokens || 0;
+      agg._cost += costOf(r);
+    });
+    return { ...tc, ...agg };
   });
 
   const toolColors = tools.map((_, i) => {
@@ -887,7 +941,7 @@ function render() {
             `Output: ${fmt(t.output_tokens)}`,
             `Cache Read: ${fmt(t.cache_read_tokens)}`,
             `Cache Create: ${fmt(t.cache_creation_tokens)}`,
-            `Est. Cost: ${usd(costOf(t))}`,
+            `Est. Cost: ${usd(t._cost)}`,
           ];
         }
       } } },
@@ -939,7 +993,7 @@ function render() {
     FROM turns t
     LEFT JOIN models m ON m.id = t.model_id
     ${twt} GROUP BY t.session_id ORDER BY first_turn DESC`);
-  sessions.forEach(s => s._cost = costOf(s));
+  sessions.forEach(s => s._cost = costBySession[s.session_id] || 0);
   lastSessionData = sessions;
   renderSessionTable();
 
@@ -968,6 +1022,7 @@ async function loadDb(arrayBuffer) {
   if (DB) DB.close();
   DB = new sqlJs.Database(new Uint8Array(arrayBuffer));
   ensureDbSchema();
+  await loadPricing();
   document.getElementById('drop-zone').style.display = 'none';
   document.getElementById('dashboard').style.display = 'block';
   render();
@@ -1003,7 +1058,9 @@ const fp = flatpickr('#date-range-picker', {
   disableMobile: true,
   onChange(dates) {
     if (dates.length === 2) {
-      const fmt = d => d.toISOString().slice(0, 10);
+      // Format in local time — flatpickr dates are at local midnight, so
+      // toISOString() (UTC) would shift the day for users east of UTC.
+      const fmt = d => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
       dateFrom = fmt(dates[0]);
       dateTo = fmt(dates[1]);
       dateRange = 'custom';
@@ -1095,6 +1152,39 @@ async function checkForUpdates() {
     banner.appendChild(link);
     banner.style.display = 'block';
   } catch {}
+}
+
+// Overlay MODEL_PRICING from pricing.json. Tries the repo's latest (GitHub raw)
+// first so newly-published prices take effect without reinstalling, then the
+// bundled local copy, then leaves the built-in constants as the offline fallback.
+async function loadPricing() {
+  let repo = 'JamesDBartlett3/claude-code-token-usage-dashboard';
+  try {
+    const v = await (await fetch('version.json', { cache: 'no-store' })).json();
+    if (v && v.repository) repo = v.repository;
+  } catch {}
+  const sources = [
+    `https://raw.githubusercontent.com/${repo}/main/pricing.json`,
+    'pricing.json',
+  ];
+  for (const url of sources) {
+    try {
+      const r = await fetch(url, { cache: 'no-store' });
+      if (!r.ok) continue;
+      const data = await r.json();
+      const tiers = (data && data.tiers) || data;
+      if (!tiers) continue;
+      let applied = false;
+      for (const k of Object.keys(tiers)) {
+        const p = tiers[k];
+        if (p && typeof p.input === 'number') {
+          MODEL_PRICING[k] = { input: p.input, output: p.output, cacheRead: p.cache_read, cacheCreate: p.cache_create };
+          applied = true;
+        }
+      }
+      if (applied) return;
+    } catch {}
+  }
 }
 
 async function reloadDb() {
@@ -1207,6 +1297,7 @@ checkForUpdates();
     if (!resp.ok) throw new Error(resp.status);
     sqlJs = await initSqlJs({ locateFile: f => `https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.12.0/${f}` });
     DB = new sqlJs.Database(new Uint8Array(await resp.arrayBuffer()));
+    await loadPricing();
     document.getElementById('drop-zone').style.display = 'none';
     document.getElementById('dashboard').style.display = 'block';
     render();

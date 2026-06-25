@@ -27,6 +27,7 @@ jobs:
             install.py \
             install.sh \
             migrations \
+            pricing.json \
             report.html \
             serve_report.py \
             version.json

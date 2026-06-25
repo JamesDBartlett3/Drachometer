@@ -1,0 +1,55 @@
+name: Update pricing
+
+# Refreshes pricing.json from Anthropic's published pricing. Every tier is
+# optional (a model that disappears from the page keeps its last-known price),
+# but the scraper is fail-loud: if it cannot parse ANY pricing at all it exits
+# non-zero, this job fails (notifying maintainers via GitHub's failed-run
+# notifications), and the last-good pricing.json stays committed and in effect.
+#
+# Autonomous commit requirement: this job pushes directly to the default branch
+# using the built-in GITHUB_TOKEN. That needs the repository's Actions token to
+# allow writes. If pushes 403, enable:
+#   Settings -> Actions -> General -> Workflow permissions
+#     -> "Read and write permissions"
+# (main is not a protected branch, so no PR is required. If you later protect
+# main, switch this step to open a pull request instead of pushing.)
+
+on:
+  schedule:
+    - cron: "0 12 * * 1" # every Monday at 12:00 UTC
+  workflow_dispatch: {} # allow manual runs from the Actions tab
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-pricing
+  cancel-in-progress: false
+
+jobs:
+  update-pricing:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6.0.3
+
+      - name: Set up Python
+        uses: actions/setup-python@v6.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Scrape latest pricing
+        run: python scripts/update_pricing.py
+
+      - name: Commit pricing.json if it changed
+        run: |
+          if git diff --quiet -- pricing.json; then
+            echo "Pricing unchanged; nothing to commit."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add pricing.json
+          git commit -m "chore: update model pricing from Anthropic"
+          git push

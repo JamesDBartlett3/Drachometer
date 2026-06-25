@@ -240,15 +240,35 @@ Recommended manual upgrade procedure (if you run SQL migration directly):
 
 ## Model Pricing
 
-Costs are calculated at logging time using hardcoded per-tier pricing (dollars per million tokens):
+All per-token pricing lives in one place — [`pricing.json`](pricing.json) — and is expressed in dollars per million tokens per model tier:
 
-| Tier | Input | Output | Cache Read | Cache Create |
-|---|---|---|---|---|
-| **Opus** | $15.00 | $75.00 | $1.50 | $18.75 |
-| **Sonnet** | $3.00 | $15.00 | $0.30 | $3.75 |
-| **Haiku** | $0.80 | $4.00 | $0.08 | $1.00 |
+```json
+{
+  "tiers": {
+    "opus":   { "input": 5,  "output": 25, "cache_read": 0.5,  "cache_create": 6.25 },
+    "sonnet": { "input": 3,  "output": 15, "cache_read": 0.3,  "cache_create": 3.75 },
+    "haiku":  { "input": 1,  "output": 5,  "cache_read": 0.1,  "cache_create": 1.25 }
+  }
+}
+```
 
-The tier is inferred from the model key (e.g. `claude-sonnet-4-20250514` → Sonnet). If a model key doesn't match a known tier, pricing defaults to `0` and cost rows will show $0.00 until the `models` table is updated manually or a new release ships updated pricing.
+The tier is inferred from the model key (e.g. `claude-sonnet-4-6` → Sonnet). The same file is read by all three components, so they never disagree:
+
+- The **dashboard** fetches the latest `pricing.json` from the repo (GitHub raw) on load, falling back to the installed copy, then to a built-in table if offline.
+- The **hook** reads its installed copy when it first records a model, storing that model's prices in the `models` table.
+- The **installer** reads it when creating model rows during install/migration.
+
+A turn's cost uses the model's stored per-row pricing when present (so you can hand-edit a model's prices in the `models` table), otherwise its tier's pricing. A model key that matches no known tier is costed at `$0.00` (an honest "unknown") rather than being silently assumed to be a particular tier.
+
+### Automatic pricing updates
+
+Anthropic does not publish a pricing REST API, so [`.github/workflows/update-pricing.yml`](.github/workflows/update-pricing.yml) runs [`scripts/update_pricing.py`](scripts/update_pricing.py) on a weekly schedule (and on demand) to scrape the published pricing and commit any changes to `pricing.json`.
+
+Every tier is **optional**: if a model disappears from the pricing page (e.g. a withdrawn model), its last-known price is preserved rather than wiped. The scraper is also **fail-loud**: if it can't parse *any* pricing at all — which means the page format or URL changed — it exits non-zero and writes nothing, so the workflow run fails (notifying maintainers) while the last-good `pricing.json` stays in effect.
+
+The `fable` tier is fully wired through the dashboard, hook, and installer, so when Claude Fable pricing is published it is picked up automatically with no code or schema change.
+
+> The autonomous commit needs the repository's Actions token to allow writes — enable **Settings → Actions → General → Workflow permissions → "Read and write permissions"**.
 
 ## Data Retention
 
@@ -266,12 +286,15 @@ install.bat             # Double-click installer (Windows zip)
 install.ps1             # Network installer bootstrap (Windows PowerShell)
 install.py              # Installer script
 install.sh              # Network installer bootstrap (Mac/Linux/WSL2)
-.github/workflows/release-package.yml # Publishes the release zip asset
 hooks/log_usage.py      # Hook script (Stop + PostToolUse events)
 serve_report.py         # Dashboard server (auto-launched by hook)
 report.html             # Browser dashboard (sql.js + Chart.js)
+pricing.json            # Per-tier model pricing (single source of truth)
 version.json            # App version + GitHub release metadata
 coin.svg                # Logo / favicon artwork
+scripts/update_pricing.py             # Scrapes Anthropic pricing -> pricing.json
+.github/workflows/release-package.yml # Publishes the release zip asset
+.github/workflows/update-pricing.yml  # Weekly pricing refresh (commits pricing.json)
 ```
 
 ## Installed Locations
@@ -282,6 +305,7 @@ After install, the source folder can be deleted. Everything runs from:
 ~/.claude/hooks/claude-code-token-usage-dashboard/log_usage.py    # Hook script
 ~/.claude/hooks/claude-code-token-usage-dashboard/serve_report.py # Dashboard server
 ~/.claude/hooks/claude-code-token-usage-dashboard/report.html     # Dashboard
+~/.claude/hooks/claude-code-token-usage-dashboard/pricing.json    # Per-tier model pricing
 ~/.claude/hooks/claude-code-token-usage-dashboard/version.json    # Installed version metadata
 ~/.claude/token_usage.db          # SQLite database
 ~/.claude/settings.json           # Hook registrations (merged, not replaced)

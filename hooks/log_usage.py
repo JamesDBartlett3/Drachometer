@@ -14,11 +14,35 @@ LEGACY_REPORT_SERVER = Path.home() / ".claude" / "hooks" / "serve_report.py"
 REPORT_SERVER = Path.home() / ".claude" / "hooks" / "claude-code-token-usage-dashboard" / "serve_report.py"
 REPORT_PORT = 9873
 
+# Offline fallback pricing (USD per 1M tokens). Overlaid at import by values
+# from pricing.json (installed alongside this script, kept fresh by a GitHub
+# Action) so newly-logged models are priced from the latest published rates.
 MODEL_TIER_PRICING = {
-    "opus":   {"input": 15.0, "output": 75.0, "cache_read": 1.50, "cache_create": 18.75},
-    "sonnet": {"input": 3.0,  "output": 15.0, "cache_read": 0.30, "cache_create": 3.75},
-    "haiku":  {"input": 0.8,  "output": 4.0,  "cache_read": 0.08, "cache_create": 1.0},
+    "opus":   {"input": 5.0, "output": 25.0, "cache_read": 0.50, "cache_create": 6.25},
+    "sonnet": {"input": 3.0, "output": 15.0, "cache_read": 0.30, "cache_create": 3.75},
+    "haiku":  {"input": 1.0, "output": 5.0,  "cache_read": 0.10, "cache_create": 1.25},
 }
+
+
+def _load_pricing_overrides() -> None:
+    pricing_path = Path(__file__).resolve().parent / "pricing.json"
+    try:
+        data = json.loads(pricing_path.read_text(encoding="utf-8"))
+        tiers = data.get("tiers", data)
+        if isinstance(tiers, dict):
+            for tier, p in tiers.items():
+                if isinstance(p, dict) and isinstance(p.get("input"), (int, float)):
+                    MODEL_TIER_PRICING[tier] = {
+                        "input": p.get("input"),
+                        "output": p.get("output"),
+                        "cache_read": p.get("cache_read"),
+                        "cache_create": p.get("cache_create"),
+                    }
+    except Exception:
+        pass
+
+
+_load_pricing_overrides()
 
 
 def infer_model_attributes(model_key: str | None) -> dict:
@@ -35,7 +59,9 @@ def infer_model_attributes(model_key: str | None) -> dict:
             "cache_creation_price_per_mtok": None,
         }
 
-    if "opus" in lower:
+    if "fable" in lower:
+        tier = "fable"
+    elif "opus" in lower:
         tier = "opus"
     elif "sonnet" in lower:
         tier = "sonnet"
@@ -419,7 +445,11 @@ def handle_post_tool_use(conn: sqlite3.Connection, payload: dict) -> None:
     tool_input = tool.get("input") or payload.get("tool_input")
 
     result    = payload.get("tool_result") or payload.get("result") or {}
-    exit_code = result.get("exit_code")    or payload.get("exit_code")
+    # Use an explicit None check: a successful exit_code of 0 is falsy, so
+    # `result.get("exit_code") or payload.get("exit_code")` would discard it.
+    exit_code = result.get("exit_code")
+    if exit_code is None:
+        exit_code = payload.get("exit_code")
     error     = result.get("stderr")       or payload.get("error")
 
     # Resolve turn_pk if the turns row already exists (it usually won't yet)

@@ -34,6 +34,7 @@ REPO_SERVER = Path(__file__).resolve().parent / "serve_report.py"
 REPO_README = Path(__file__).resolve().parent / "README.md"
 REPO_COIN = Path(__file__).resolve().parent / "coin.svg"
 REPO_VERSION = Path(__file__).resolve().parent / "version.json"
+REPO_PRICING = Path(__file__).resolve().parent / "pricing.json"
 
 APP_METADATA = json.loads(REPO_VERSION.read_text(encoding="utf-8"))
 APP_VERSION = str(APP_METADATA.get("version", "0.0.0"))
@@ -45,13 +46,36 @@ HOOK_FILES = {
     "README.md": REPO_README,
     "coin.svg": REPO_COIN,
     "version.json": REPO_VERSION,
+    "pricing.json": REPO_PRICING,
 }
 
+# Offline fallback pricing (USD per 1M tokens). Overlaid below from pricing.json
+# so model rows the installer creates/backfills use the latest published rates.
 MODEL_TIER_PRICING = {
-    "opus":   {"input": 15.0, "output": 75.0, "cache_read": 1.50, "cache_create": 18.75},
-    "sonnet": {"input": 3.0,  "output": 15.0, "cache_read": 0.30, "cache_create": 3.75},
-    "haiku":  {"input": 0.8,  "output": 4.0,  "cache_read": 0.08, "cache_create": 1.0},
+    "opus":   {"input": 5.0, "output": 25.0, "cache_read": 0.50, "cache_create": 6.25},
+    "sonnet": {"input": 3.0, "output": 15.0, "cache_read": 0.30, "cache_create": 3.75},
+    "haiku":  {"input": 1.0, "output": 5.0,  "cache_read": 0.10, "cache_create": 1.25},
 }
+
+
+def _load_pricing_overrides() -> None:
+    try:
+        data = json.loads(REPO_PRICING.read_text(encoding="utf-8"))
+        tiers = data.get("tiers", data)
+        if isinstance(tiers, dict):
+            for tier, p in tiers.items():
+                if isinstance(p, dict) and isinstance(p.get("input"), (int, float)):
+                    MODEL_TIER_PRICING[tier] = {
+                        "input": p.get("input"),
+                        "output": p.get("output"),
+                        "cache_read": p.get("cache_read"),
+                        "cache_create": p.get("cache_create"),
+                    }
+    except (OSError, json.JSONDecodeError, ValueError):
+        pass
+
+
+_load_pricing_overrides()
 
 
 def semver_key(version: str | None) -> tuple[int, int, int]:
@@ -149,8 +173,17 @@ def apply_sql_migrations() -> None:
         return
 
     with sqlite3.connect(DB_PATH) as conn:
+        # A migration .sql assumes the legacy `turns` table already exists. On a
+        # fresh/empty database there is nothing to migrate -- init_database()
+        # creates the current schema and records migrations as applied -- so
+        # skip here rather than running SQL that would fail against a missing table.
+        if not conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='turns'"
+        ).fetchone():
+            return
+
         conn.execute("CREATE TABLE IF NOT EXISTS schema_migrations (version TEXT PRIMARY KEY)")
-        
+
         # Check if 001 was already applied implicitly
         cursor = conn.execute("PRAGMA table_info(turns)")
         columns = [row[1] for row in cursor.fetchall()]
@@ -168,8 +201,12 @@ def apply_sql_migrations() -> None:
                     conn.execute("INSERT INTO schema_migrations (version) VALUES (?)", (version,))
                     conn.commit()
                 except Exception as e:
-                    print(f"  Error applying migration {version}: {e}")
-                    sys.exit(1)
+                    # Don't abort the whole install: init_database() runs next and
+                    # brings the schema to the current version via its own idempotent
+                    # logic. Leave this migration unrecorded so it retries later.
+                    print(f"  WARNING: could not apply SQL migration {version}: {e}")
+                    print("  Continuing; database initialization will ensure the current schema.")
+                    break
 
 
 def run_install_migrations(installed_version: str) -> None:
@@ -184,7 +221,9 @@ def infer_model_attributes(model_key: str | None) -> dict:
     key = (model_key or "").strip()
     lower = key.lower()
 
-    if "opus" in lower:
+    if "fable" in lower:
+        tier = "fable"
+    elif "opus" in lower:
         tier = "opus"
     elif "sonnet" in lower:
         tier = "sonnet"
