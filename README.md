@@ -281,6 +281,68 @@ You can automatically purge old records by setting a retention window (in days):
 
 When configured, the hook deletes `turns` and `tool_calls` rows older than the retention window each time it runs.
 
+## Mesh Replication (LAN/VM)
+
+> **Status:** Phase 1 (MVP). Opt-in and off by default — single-node users are unaffected.
+
+Mesh replication lets several machines on the same trusted network share one combined view of your Claude Code usage. Each node keeps its own local database and they converge toward the union of everyone's history.
+
+### Scope and safety
+
+- **LAN/VM networks only.** This is designed for a home/lab network or a set of VMs. It is **out of scope** for the public internet/WAN.
+- **Not a security boundary.** There is no authentication and no TLS. The mesh identifier exists to prevent *accidental* cross-merges between unrelated meshes that happen to share a LAN (coworkers, roommates) — not to keep data private. **Do not expose the mesh port to the internet.** Restrict it with your firewall to the LAN/VM subnet.
+
+### How it works
+
+- Every local write to `turns`/`tool_calls` also appends an immutable event to an append-only `oplog`, keyed by a **content hash** so applying the same event twice is a no-op.
+- Nodes gossip over plain HTTP using **pull-based anti-entropy**: a node compares per-origin event counts with each peer and fetches only the events it is missing. No broker and no third-party dependencies.
+- Because each Claude Code session runs on a single machine, `session_id` partitions writes by node, so merging is a conflict-free **union**. The rare case of the same turn re-logged is resolved last-writer-wins by timestamp.
+
+### Enabling it
+
+Create a new mesh on the first node (during install or any time afterward):
+
+```powershell
+# during install
+python drachometer-install.py --enable-mesh --mesh-name home
+
+# or later, from the installed location
+python "$HOME/.claude/hooks/drachometer/drachometer_mesh.py" init --name home
+```
+
+This prints a **mesh id** like `home-a1b2c3d4`. Join it from another node:
+
+```powershell
+python drachometer-install.py --join-mesh home-a1b2c3d4 --peer 192.168.1.10:9874
+# or later:
+python "$HOME/.claude/hooks/drachometer/drachometer_mesh.py" join home-a1b2c3d4 --peer 192.168.1.10:9874
+```
+
+Options: `--mesh-port` (default `9874`), `--advertise HOST` (the address peers use to reach this node; auto-detected if omitted), and repeatable `--peer HOST:PORT` seeds. The mesh server starts automatically with the report server.
+
+Joining a node that already has history is safe: its existing rows are **backfilled** into the oplog and replicate to peers, while peers' history flows back — so two independently-created clients converge to the union.
+
+### Maintenance
+
+```powershell
+python "$HOME/.claude/hooks/drachometer/drachometer_mesh.py" status          # config, oplog counts, peer reachability
+python "$HOME/.claude/hooks/drachometer/drachometer_mesh.py" import OTHER.db  # merge an offline database file
+python "$HOME/.claude/hooks/drachometer/drachometer_mesh.py" disable          # stop replicating (history preserved)
+```
+
+### Firewall
+
+Allow inbound TCP on the mesh port (default `9874`) **only from your LAN/VM subnet**. Example (Windows PowerShell, adjust the subnet):
+
+```powershell
+New-NetFirewallRule -DisplayName "Drachometer mesh" -Direction Inbound -Protocol TCP `
+  -LocalPort 9874 -RemoteAddress 192.168.1.0/24 -Action Allow
+```
+
+### Recovery
+
+A new or long-offline node converges automatically on the next gossip round — its first anti-entropy pass pulls the full event history (the bootstrap snapshot), and subsequent rounds catch up incrementally. If a node's database is lost, reinstall, re-`join` the mesh with the same mesh id, and it will re-pull everyone's history. Diagnostics are written to `~/.claude/drachometer-mesh.log`.
+
 ## Files
 
 ```
@@ -290,6 +352,7 @@ drachometer-install.py              # Installer script
 drachometer-install.sh              # Network installer bootstrap (Mac/Linux/WSL2)
 hooks/drachometer-log-usage.py      # Hook script (Stop + PostToolUse events)
 drachometer-serve-report.py         # Dashboard server (auto-launched by hook)
+drachometer_mesh.py                 # Mesh replication library + CLI (opt-in, LAN/VM)
 drachometer-dashboard.html             # Browser dashboard (sql.js + Chart.js)
 drachometer-pricing.json            # Per-tier model pricing (single source of truth)
 drachometer-version.json # App version + GitHub release metadata
@@ -306,10 +369,13 @@ After install, the source folder can be deleted. Everything runs from:
 ```
 ~/.claude/hooks/drachometer/drachometer-log-usage.py    # Hook script
 ~/.claude/hooks/drachometer/drachometer-serve-report.py # Dashboard server
+~/.claude/hooks/drachometer/drachometer_mesh.py         # Mesh replication library + CLI
 ~/.claude/hooks/drachometer/drachometer-dashboard.html     # Dashboard
 ~/.claude/hooks/drachometer/drachometer-pricing.json    # Per-tier model pricing
 ~/.claude/hooks/drachometer/drachometer-version.json    # Installed version metadata
 ~/.claude/drachometer.db          # SQLite database
+~/.claude/drachometer-mesh.json   # Mesh config (only if mesh is enabled)
+~/.claude/drachometer-mesh.log    # Mesh diagnostics (only if mesh is enabled)
 ~/.claude/settings.json           # Hook registrations (merged, not replaced)
 ```
 
@@ -334,6 +400,15 @@ You can also open `drachometer-dashboard.html` directly in a browser and drag-an
    # Windows PowerShell
    Remove-Item -Recurse -Force "$HOME/.claude/hooks/drachometer/"
    Remove-Item "$HOME/.claude/drachometer.db"
+   ```
+3. If you enabled mesh replication, also remove its config and log:
+   ```bash
+   # Mac / Linux / WSL2
+   rm -f ~/.claude/drachometer-mesh.json ~/.claude/drachometer-mesh.log
+   ```
+   ```powershell
+   # Windows PowerShell
+   Remove-Item -Force "$HOME/.claude/drachometer-mesh.json", "$HOME/.claude/drachometer-mesh.log" -ErrorAction SilentlyContinue
    ```
 
 ## Requirements

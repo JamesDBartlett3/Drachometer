@@ -1,0 +1,247 @@
+#!/usr/bin/env python3
+"""Tests for drachometer mesh replication (phase 1).
+
+Stdlib unittest only -- no third-party dependencies, matching the project.
+Run with:  python -m unittest discover -s tests
+"""
+
+import sqlite3
+import sys
+import tempfile
+import threading
+import unittest
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import drachometer_mesh as mesh  # noqa: E402
+
+# Minimal slice of the production schema sufficient to exercise replication.
+BASE_SCHEMA = """
+CREATE TABLE models (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    model_key TEXT NOT NULL UNIQUE,
+    model_name TEXT, model_version TEXT, model_provider TEXT,
+    input_price_per_mtok REAL, output_price_per_mtok REAL,
+    cache_read_price_per_mtok REAL, cache_creation_price_per_mtok REAL
+);
+CREATE TABLE turns (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL, turn_id TEXT NOT NULL, recorded_at TEXT NOT NULL,
+    stop_reason TEXT,
+    input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens INTEGER NOT NULL DEFAULT 0, cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+    cwd TEXT, git_branch TEXT, model TEXT,
+    model_id INTEGER REFERENCES models(id),
+    UNIQUE(session_id, turn_id)
+);
+CREATE TABLE tool_calls (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    turn_pk INTEGER REFERENCES turns(id) ON DELETE CASCADE,
+    session_id TEXT NOT NULL, turn_id TEXT NOT NULL, recorded_at TEXT NOT NULL,
+    tool_name TEXT, tool_input TEXT, exit_code INTEGER, error TEXT
+);
+"""
+
+
+def seed_db(path: Path, node_id: str, sessions, model_key="claude-opus-4-8"):
+    """Create a schema-complete DB, insert one turn per session, emit events."""
+    conn = sqlite3.connect(path)
+    conn.executescript(BASE_SCHEMA)
+    mesh.ensure_schema(conn)
+    mid = mesh.ensure_model_row(conn, model_key)
+    for i, sess in enumerate(sessions):
+        recorded = f"2026-06-26T10:0{i}:00+00:00"
+        conn.execute(
+            """INSERT INTO turns (session_id, turn_id, recorded_at, stop_reason,
+                   input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
+                   cwd, git_branch, model, model_id)
+               VALUES (?, 'turn-1', ?, 'end_turn', 100, 50, 0, 0, '/tmp', 'main', ?, ?)""",
+            (sess, recorded, model_key, mid),
+        )
+        conn.execute(
+            """INSERT INTO tool_calls (uid, turn_pk, session_id, turn_id, recorded_at,
+                   tool_name, tool_input, exit_code, error)
+               VALUES (?, NULL, ?, 'turn-1', ?, 'Bash', '{}', 0, NULL)""",
+            (f"{node_id}-tc-{i}", sess, recorded),
+        )
+    conn.commit()
+    mesh.backfill(conn, node_id)
+    conn.close()
+
+
+def turn_sessions(path: Path):
+    conn = sqlite3.connect(path)
+    try:
+        return {r[0] for r in conn.execute("SELECT session_id FROM turns")}
+    finally:
+        conn.close()
+
+
+def event_count(path: Path):
+    conn = sqlite3.connect(path)
+    try:
+        return conn.execute("SELECT COUNT(*) FROM oplog").fetchone()[0]
+    finally:
+        conn.close()
+
+
+class MeshTestBase(unittest.TestCase):
+    def setUp(self):
+        # ignore_cleanup_errors: on Windows a mesh server's daemon thread or a
+        # lingering WAL handle can briefly hold a DB file past server shutdown.
+        self._tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.tmp = Path(self._tmp.name)
+        # Registered first -> runs last (LIFO), after any server shutdown a test
+        # adds, so the DB files are unlocked before the temp dir is removed.
+        self.addCleanup(self._tmp.cleanup)
+        # Redirect module globals so nothing touches the real ~/.claude.
+        self._orig = (mesh.DB_PATH, mesh.CONFIG_PATH, mesh.LOG_PATH)
+        self.addCleanup(self._restore_globals)
+        mesh.DB_PATH = self.tmp / "drachometer.db"
+        mesh.CONFIG_PATH = self.tmp / "mesh.json"
+        mesh.LOG_PATH = self.tmp / "mesh.log"
+
+    def _restore_globals(self):
+        mesh.DB_PATH, mesh.CONFIG_PATH, mesh.LOG_PATH = self._orig
+
+
+class TestEventIdentity(MeshTestBase):
+    def test_emit_is_idempotent_on_identical_content(self):
+        db = self.tmp / "a.db"
+        seed_db(db, "nodeA", ["s1"])
+        conn = sqlite3.connect(db)
+        before = conn.execute("SELECT COUNT(*) FROM oplog").fetchone()[0]
+        # Re-emit the exact same turn content: content hash collides -> no-op.
+        mesh.emit_event(conn, "nodeA", "turn", mesh.turn_payload({
+            "session_id": "s1", "turn_id": "turn-1",
+            "recorded_at": "2026-06-26T10:00:00+00:00", "stop_reason": "end_turn",
+            "input_tokens": 100, "output_tokens": 50, "cache_read_tokens": 0,
+            "cache_creation_tokens": 0, "cwd": "/tmp", "git_branch": "main",
+            "model_key": "claude-opus-4-8",
+        }))
+        conn.commit()
+        after = conn.execute("SELECT COUNT(*) FROM oplog").fetchone()[0]
+        conn.close()
+        self.assertEqual(before, after)
+
+    def test_apply_event_idempotent(self):
+        src = self.tmp / "src.db"
+        dst = self.tmp / "dst.db"
+        seed_db(src, "nodeA", ["s1"])
+        conn_dst = sqlite3.connect(dst)
+        conn_dst.executescript(BASE_SCHEMA)
+        mesh.ensure_schema(conn_dst)
+        conn_src = sqlite3.connect(src)
+        events = [dict(zip(
+            ["event_id", "origin_node", "lamport", "created_at", "entity", "op", "payload"], r))
+            for r in conn_src.execute(
+                "SELECT event_id, origin_node, lamport, created_at, entity, op, payload FROM oplog")]
+        conn_src.close()
+        first = sum(mesh.apply_event(conn_dst, ev) for ev in events)
+        second = sum(mesh.apply_event(conn_dst, ev) for ev in events)
+        conn_dst.commit()
+        self.assertEqual(first, len(events))
+        self.assertEqual(second, 0)  # replay applies nothing
+        conn_dst.close()
+
+    def test_lww_does_not_overwrite_newer_turn(self):
+        dst = self.tmp / "dst.db"
+        conn = sqlite3.connect(dst)
+        conn.executescript(BASE_SCHEMA)
+        mesh.ensure_schema(conn)
+        newer = {"session_id": "s1", "turn_id": "turn-1",
+                 "recorded_at": "2026-06-26T12:00:00+00:00", "stop_reason": "end_turn",
+                 "input_tokens": 999, "output_tokens": 0, "cache_read_tokens": 0,
+                 "cache_creation_tokens": 0, "cwd": None, "git_branch": None,
+                 "model_key": "claude-opus-4-8"}
+        older = dict(newer, recorded_at="2026-06-26T08:00:00+00:00", input_tokens=1)
+        mesh.apply_event(conn, {"event_id": "e-new", "origin_node": "n", "lamport": 2,
+                                "created_at": newer["recorded_at"], "entity": "turn",
+                                "op": "upsert", "payload": newer})
+        mesh.apply_event(conn, {"event_id": "e-old", "origin_node": "n", "lamport": 1,
+                                "created_at": older["recorded_at"], "entity": "turn",
+                                "op": "upsert", "payload": older})
+        conn.commit()
+        tokens = conn.execute(
+            "SELECT input_tokens FROM turns WHERE session_id='s1'").fetchone()[0]
+        conn.close()
+        self.assertEqual(tokens, 999)  # newer record wins regardless of apply order
+
+
+class TestImportMerge(MeshTestBase):
+    def test_import_merges_independent_client_without_oplog(self):
+        foreign = self.tmp / "foreign.db"
+        # A foreign DB that was never mesh-enabled: build it then drop its oplog.
+        seed_db(foreign, "ignored", ["x1", "x2"])
+        fc = sqlite3.connect(foreign)
+        fc.executescript("DROP TABLE oplog;")
+        fc.commit()
+        fc.close()
+
+        local = self.tmp / "local.db"
+        seed_db(local, "nodeLocal", ["l1"])
+        conn = sqlite3.connect(local)
+        applied_first = mesh.import_database(conn, foreign, label="bob")
+        applied_again = mesh.import_database(conn, foreign, label="bob")
+        conn.close()
+
+        self.assertGreater(applied_first, 0)
+        self.assertEqual(applied_again, 0)  # re-import is idempotent
+        self.assertEqual(turn_sessions(local), {"l1", "x1", "x2"})
+
+
+class TestTwoNodeConvergence(MeshTestBase):
+    def _serve(self, cfg, db_path):
+        registry = mesh._PeerRegistry(cfg)
+        handler = mesh._make_mesh_handler(cfg, registry, "test", db_path)
+        server = mesh._ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return server.server_address[1]
+
+    def test_bidirectional_convergence_and_idempotency(self):
+        db_a = self.tmp / "a.db"
+        db_b = self.tmp / "b.db"
+        seed_db(db_a, "nodeA", ["a1", "a2", "a3"])
+        seed_db(db_b, "nodeB", ["b1", "b2"])
+        cfg_a = {"mesh_id": "test-mesh", "node_id": "nodeA", "peers": []}
+        cfg_b = {"mesh_id": "test-mesh", "node_id": "nodeB", "peers": []}
+
+        port_a = self._serve(cfg_a, db_a)
+        port_b = self._serve(cfg_b, db_b)
+
+        # A pulls from B (local DB = A), then B pulls from A (local DB = B).
+        mesh.DB_PATH = db_a
+        applied_ab = mesh.sync_with_peer(cfg_a, f"127.0.0.1:{port_b}")
+        mesh.DB_PATH = db_b
+        applied_ba = mesh.sync_with_peer(cfg_b, f"127.0.0.1:{port_a}")
+
+        self.assertGreater(applied_ab, 0)
+        self.assertGreater(applied_ba, 0)
+        all_sessions = {"a1", "a2", "a3", "b1", "b2"}
+        self.assertEqual(turn_sessions(db_a), all_sessions)
+        self.assertEqual(turn_sessions(db_b), all_sessions)
+        self.assertEqual(event_count(db_a), event_count(db_b))
+
+        # Second round converges with nothing new to apply.
+        mesh.DB_PATH = db_a
+        self.assertEqual(mesh.sync_with_peer(cfg_a, f"127.0.0.1:{port_b}"), 0)
+
+    def test_mesh_id_mismatch_blocks_replication(self):
+        db_a = self.tmp / "a.db"
+        db_b = self.tmp / "b.db"
+        seed_db(db_a, "nodeA", ["a1"])
+        seed_db(db_b, "nodeB", ["b1"])
+        cfg_b = {"mesh_id": "their-mesh", "node_id": "nodeB", "peers": []}
+        port_b = self._serve(cfg_b, db_b)
+
+        cfg_a = {"mesh_id": "my-mesh", "node_id": "nodeA", "peers": []}
+        mesh.DB_PATH = db_a
+        applied = mesh.sync_with_peer(cfg_a, f"127.0.0.1:{port_b}")
+        self.assertEqual(applied, 0)
+        self.assertEqual(turn_sessions(db_a), {"a1"})  # nothing leaked across meshes
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

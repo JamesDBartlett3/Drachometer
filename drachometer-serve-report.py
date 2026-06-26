@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Minimal HTTP server that serves drachometer-dashboard.html, drachometer.db, and SSE live-refresh."""
 
+import json
 import sys
 import threading
 import time
@@ -11,6 +12,21 @@ from pathlib import Path
 PORT = 9873
 SCRIPT_DIR = Path(__file__).resolve().parent
 DB_PATH = Path.home() / ".claude" / "drachometer.db"
+
+# Optional mesh replication; absence leaves the loopback report server unchanged.
+sys.path.insert(0, str(SCRIPT_DIR))
+try:
+    import drachometer_mesh as mesh
+except Exception:
+    mesh = None
+
+
+def _app_version() -> str:
+    try:
+        data = json.loads((SCRIPT_DIR / "drachometer-version.json").read_text(encoding="utf-8"))
+        return str(data.get("version", ""))
+    except (OSError, json.JSONDecodeError, ValueError):
+        return ""
 
 # Tracks the last-known mtime of the DB file; SSE clients poll this.
 _db_mtime = 0.0
@@ -84,6 +100,15 @@ class Handler(SimpleHTTPRequestHandler):
 def main():
     watcher = threading.Thread(target=_watch_db, daemon=True)
     watcher.start()
+
+    # Start mesh replication if the user has enabled it. The mesh listener binds
+    # its own LAN-facing port; this report server stays loopback-only.
+    if mesh is not None:
+        try:
+            if mesh.start_mesh(_app_version()):
+                print("Mesh replication active.")
+        except Exception:
+            pass
 
     class ThreadingServer(ThreadingMixIn, HTTPServer):
         daemon_threads = True

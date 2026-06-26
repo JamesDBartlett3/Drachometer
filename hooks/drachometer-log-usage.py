@@ -5,8 +5,18 @@ import re
 import sqlite3
 import subprocess
 import sys
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+# Optional mesh replication. Importable from the same directory the installer
+# copies both files into; absence (or any import error) leaves logging fully
+# functional as a single-node tracker.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+try:
+    import drachometer_mesh as mesh
+except Exception:
+    mesh = None
 
 DB_PATH = Path.home() / ".claude" / "drachometer.db"
 SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
@@ -168,13 +178,32 @@ def init_db(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_turns_session ON turns(session_id, turn_id);
         CREATE INDEX IF NOT EXISTS idx_calls_turn_pk ON tool_calls(turn_pk);
         CREATE INDEX IF NOT EXISTS idx_calls_session ON tool_calls(session_id, turn_id);
+
+        -- Mesh replication oplog (empty and harmless when mesh is disabled).
+        CREATE TABLE IF NOT EXISTS oplog (
+            event_id    TEXT    PRIMARY KEY,
+            origin_node TEXT    NOT NULL,
+            lamport     INTEGER NOT NULL,
+            created_at  TEXT    NOT NULL,
+            entity      TEXT    NOT NULL,
+            op          TEXT    NOT NULL DEFAULT 'upsert',
+            payload     TEXT    NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_oplog_origin_lamport ON oplog(origin_node, lamport);
+        CREATE INDEX IF NOT EXISTS idx_oplog_lamport        ON oplog(lamport);
     """)
     for col, typedef in [("cwd", "TEXT"), ("git_branch", "TEXT"), ("model", "TEXT"), ("model_id", "INTEGER REFERENCES models(id)")]:
         try:
             conn.execute(f"ALTER TABLE turns ADD COLUMN {col} {typedef}")
         except sqlite3.OperationalError:
             pass
+    # Global identity for tool_calls, used by mesh replication.
+    try:
+        conn.execute("ALTER TABLE tool_calls ADD COLUMN uid TEXT")
+    except sqlite3.OperationalError:
+        pass
     conn.execute("CREATE INDEX IF NOT EXISTS idx_turns_model_id ON turns(model_id)")
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_tool_calls_uid ON tool_calls(uid)")
     backfill_model_dimension(conn)
     conn.commit()
 
@@ -346,7 +375,19 @@ def derive_turn_id(payload: dict) -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")
 
 
-def handle_stop(conn: sqlite3.Connection, payload: dict) -> None:
+def mesh_node_id() -> str | None:
+    """Return this node's mesh id when replication is enabled, else None."""
+    if mesh is None:
+        return None
+    try:
+        if mesh.is_enabled():
+            return (mesh.load_config() or {}).get("node_id")
+    except Exception:
+        pass
+    return None
+
+
+def handle_stop(conn: sqlite3.Connection, payload: dict, mesh_node: str | None = None) -> None:
     session_id = payload.get("session_id", "unknown")
     turn_id = derive_turn_id(payload)
     now = datetime.now(timezone.utc).isoformat()
@@ -432,10 +473,28 @@ def handle_stop(conn: sqlite3.Connection, payload: dict) -> None:
                 (turn_pk, session_id, turn_num),
             )
 
+    if mesh_node and mesh is not None:
+        try:
+            mesh.emit_event(conn, mesh_node, "turn", mesh.turn_payload({
+                "session_id": session_id,
+                "turn_id": turn_id,
+                "recorded_at": now,
+                "stop_reason": stop_reason,
+                "input_tokens": usage.get("input_tokens", 0),
+                "output_tokens": usage.get("output_tokens", 0),
+                "cache_read_tokens": usage.get("cache_read_input_tokens", 0),
+                "cache_creation_tokens": usage.get("cache_creation_input_tokens", 0),
+                "cwd": cwd,
+                "git_branch": git_branch,
+                "model_key": model,
+            }))
+        except Exception:
+            pass
+
     conn.commit()
 
 
-def handle_post_tool_use(conn: sqlite3.Connection, payload: dict) -> None:
+def handle_post_tool_use(conn: sqlite3.Connection, payload: dict, mesh_node: str | None = None) -> None:
     session_id = payload.get("session_id", "unknown")
     turn_id = derive_turn_id(payload)
     now = datetime.now(timezone.utc).isoformat()
@@ -460,21 +519,41 @@ def handle_post_tool_use(conn: sqlite3.Connection, payload: dict) -> None:
     row = cur.fetchone()
     turn_pk = row[0] if row else None
 
+    uid = uuid.uuid4().hex
+    tool_input_json = json.dumps(tool_input) if tool_input is not None else None
+    error_text = str(error) if error else None
     conn.execute("""
         INSERT INTO tool_calls (
-            turn_pk, session_id, turn_id, recorded_at,
+            uid, turn_pk, session_id, turn_id, recorded_at,
             tool_name, tool_input, exit_code, error
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
+        uid,
         turn_pk,
         session_id,
         turn_id,
         now,
         tool_name,
-        json.dumps(tool_input) if tool_input is not None else None,
+        tool_input_json,
         exit_code,
-        str(error) if error else None,
+        error_text,
     ))
+
+    if mesh_node and mesh is not None:
+        try:
+            mesh.emit_event(conn, mesh_node, "tool_call", mesh.tool_call_payload({
+                "uid": uid,
+                "session_id": session_id,
+                "turn_id": turn_id,
+                "recorded_at": now,
+                "tool_name": tool_name,
+                "tool_input": tool_input_json,
+                "exit_code": exit_code,
+                "error": error_text,
+            }))
+        except Exception:
+            pass
+
     conn.commit()
 
 
@@ -490,15 +569,20 @@ def main() -> None:
         sys.exit(0)
 
     try:
-        with sqlite3.connect(DB_PATH) as conn:
+        with sqlite3.connect(DB_PATH, timeout=5.0) as conn:
+            # WAL + a busy timeout let the hook write safely while the mesh
+            # gossip daemon (a separate process) reads/applies concurrently.
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout=5000")
             init_db(conn)
+            mesh_node = mesh_node_id()
             retention_days = get_retention_days()
             if retention_days is not None:
                 purge_old_records(conn, retention_days)
             if event == "stop":
-                handle_stop(conn, payload)
+                handle_stop(conn, payload, mesh_node)
             elif event == "post-tool-use":
-                handle_post_tool_use(conn, payload)
+                handle_post_tool_use(conn, payload, mesh_node)
         try:
             ensure_report_server()
         except Exception:

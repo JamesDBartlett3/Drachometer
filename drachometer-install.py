@@ -10,6 +10,7 @@ Usage:
     python drachometer-install.py
 """
 
+import argparse
 import json
 import re
 import shutil
@@ -30,6 +31,7 @@ LEGACY_VERSION_PATH = HOOKS_ROOT_DIR / "drachometer-version.json"
 REPO_HOOKS = Path(__file__).resolve().parent / "hooks"
 REPO_REPORT = Path(__file__).resolve().parent / "drachometer-dashboard.html"
 REPO_SERVER = Path(__file__).resolve().parent / "drachometer-serve-report.py"
+REPO_MESH = Path(__file__).resolve().parent / "drachometer_mesh.py"
 
 REPO_README = Path(__file__).resolve().parent / "README.md"
 REPO_COIN = Path(__file__).resolve().parent / "coin.svg"
@@ -42,6 +44,7 @@ APP_VERSION = str(APP_METADATA.get("version", "0.0.0"))
 HOOK_FILES = {
     "drachometer-log-usage.py": REPO_HOOKS / "drachometer-log-usage.py",
     "drachometer-serve-report.py": REPO_SERVER,
+    "drachometer_mesh.py": REPO_MESH,
     "drachometer-dashboard.html": REPO_REPORT,
     "README.md": REPO_README,
     "coin.svg": REPO_COIN,
@@ -446,13 +449,31 @@ def init_database() -> None:
             CREATE INDEX IF NOT EXISTS idx_turns_session ON turns(session_id, turn_id);
             CREATE INDEX IF NOT EXISTS idx_calls_turn_pk ON tool_calls(turn_pk);
             CREATE INDEX IF NOT EXISTS idx_calls_session ON tool_calls(session_id, turn_id);
+
+            -- Mesh replication oplog (empty and harmless when mesh is disabled).
+            CREATE TABLE IF NOT EXISTS oplog (
+                event_id    TEXT    PRIMARY KEY,
+                origin_node TEXT    NOT NULL,
+                lamport     INTEGER NOT NULL,
+                created_at  TEXT    NOT NULL,
+                entity      TEXT    NOT NULL,
+                op          TEXT    NOT NULL DEFAULT 'upsert',
+                payload     TEXT    NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_oplog_origin_lamport ON oplog(origin_node, lamport);
+            CREATE INDEX IF NOT EXISTS idx_oplog_lamport        ON oplog(lamport);
         """)
         for col, typedef in [("cwd", "TEXT"), ("git_branch", "TEXT"), ("model", "TEXT"), ("model_id", "INTEGER REFERENCES models(id)")]:
             try:
                 conn.execute(f"ALTER TABLE turns ADD COLUMN {col} {typedef}")
             except sqlite3.OperationalError:
                 pass
+        try:
+            conn.execute("ALTER TABLE tool_calls ADD COLUMN uid TEXT")
+        except sqlite3.OperationalError:
+            pass
         conn.execute("CREATE INDEX IF NOT EXISTS idx_turns_model_id ON turns(model_id)")
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_tool_calls_uid ON tool_calls(uid)")
         backfill_model_dimension(conn, prompt_if_missing=True)
 
         conn.execute("CREATE TABLE IF NOT EXISTS schema_migrations (version TEXT PRIMARY KEY)")
@@ -489,29 +510,94 @@ def smoke_test(python_exe: str) -> bool:
         return False
 
 
-def main() -> None:
+def _import_mesh():
+    """Import the freshly-copied mesh library from the install directory."""
+    sys.path.insert(0, str(HOOKS_DIR))
+    import drachometer_mesh as mesh  # noqa: E402  (path set up just above)
+    return mesh
+
+
+def configure_mesh(args) -> None:
+    """Set up mesh replication when requested (flags or interactive opt-in).
+
+    Mesh is strictly opt-in: with no flags and no interactive 'yes', this is a
+    no-op and single-node users are unaffected.
+    """
+    try:
+        mesh = _import_mesh()
+    except Exception as exc:
+        print(f"  Mesh module unavailable ({exc}); skipping mesh setup.")
+        return
+
+    peers = args.peer or []
+    if args.join_mesh:
+        cfg, emitted = mesh.join_mesh(args.join_mesh, args.mesh_port, args.advertise, peers)
+        print(f"  Joined mesh {cfg['mesh_id']} as node {cfg['node_id']}")
+        print(f"  Listening on {cfg['listen_host']}:{cfg['listen_port']}; "
+              f"backfilled {emitted} local event(s).")
+        return
+
+    want_new = args.enable_mesh
+    name = args.mesh_name
+    if not want_new and not mesh.is_enabled() and not args.no_mesh and sys.stdin.isatty():
+        answer = input("\nEnable mesh replication across LAN/VM nodes? [y/N]: ").strip().lower()
+        want_new = answer in ("y", "yes")
+        if want_new and not name:
+            name = input("  Mesh name (e.g. 'home'): ").strip() or "mesh"
+
+    if want_new:
+        cfg, emitted = mesh.enable_new_mesh(name, args.mesh_port, args.advertise, peers)
+        print(f"  Mesh enabled: {cfg['mesh_id']} (node {cfg['node_id']})")
+        print(f"  Listening on {cfg['listen_host']}:{cfg['listen_port']}; "
+              f"advertising {cfg['advertise_host']}:{cfg['advertise_port']}; "
+              f"backfilled {emitted} event(s).")
+        print("  Add another node with:")
+        print(f"    python {HOOKS_DIR / 'drachometer_mesh.py'} join {cfg['mesh_id']} "
+              f"--peer {cfg['advertise_host']}:{cfg['advertise_port']}")
+
+
+def parse_args(argv=None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Installer for drachometer.")
+    parser.add_argument("--enable-mesh", action="store_true",
+                        help="Create a new mesh on this node during install.")
+    parser.add_argument("--mesh-name", help="Human label for a new mesh (e.g. 'home').")
+    parser.add_argument("--join-mesh", metavar="MESH_ID",
+                        help="Join an existing mesh by id during install.")
+    parser.add_argument("--peer", action="append", metavar="HOST:PORT",
+                        help="Seed peer for mesh (repeatable).")
+    parser.add_argument("--mesh-port", type=int, default=9874,
+                        help="Mesh replication port (default: 9874).")
+    parser.add_argument("--advertise", help="Advertise host/IP peers use to reach this node.")
+    parser.add_argument("--no-mesh", action="store_true",
+                        help="Skip the interactive mesh opt-in prompt.")
+    return parser.parse_args(argv)
+
+
+def main(argv=None) -> None:
+    args = parse_args(argv)
+
     print("drachometer installer")
     print("=" * 40)
 
-    print("\n[1/6] Finding Python...")
+    print("\n[1/7] Finding Python...")
     python_exe = find_python()
     print(f"  Using: {python_exe}")
 
-    print("\n[2/6] Detecting installed version and running migrations...")
+    print("\n[2/7] Detecting installed version and running migrations...")
     installed_version = detect_installed_version()
     run_install_migrations(installed_version)
 
-    print("\n[3/6] Copying hook files...")
+    print("\n[3/7] Copying hook files...")
     copy_hooks(python_exe)
 
-    print("\n[4/6] Updating settings.json...")
+    print("\n[4/7] Updating settings.json...")
     merge_settings(python_exe)
 
-    print("\n[5/6] Initializing database...")
+    print("\n[5/7] Initializing database...")
     apply_sql_migrations()
     init_database()
 
-    print("\n[6/6] Running smoke test...")
+    print("\n[6/7] Running smoke test...")
     if smoke_test(python_exe):
         print("  PASS")
     else:
@@ -519,6 +605,9 @@ def main() -> None:
         print("  Check that the hook script runs without errors:")
         print(f"    {python_exe} {HOOKS_DIR / 'drachometer-log-usage.py'} stop")
         sys.exit(1)
+
+    print("\n[7/7] Configuring mesh replication...")
+    configure_mesh(args)
 
     print("\n" + "=" * 40)
     print("Installation complete!\n")

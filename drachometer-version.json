@@ -1,6 +1,6 @@
 {
   "name": "drachometer",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "repository": "JamesDBartlett3/drachometer",
   "releases_api": "https://api.github.com/repos/JamesDBartlett3/drachometer/releases/latest",
   "releases_url": "https://github.com/JamesDBartlett3/drachometer/releases/latest"

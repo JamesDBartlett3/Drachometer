@@ -31,7 +31,7 @@ File: `.github/workflows/release-package.yml`
 | Trigger | Fires on `release: types: [published]` |
 | Permissions | `contents: write` (needed to upload the release asset) |
 | Check out | Checks out the repository at the tagged commit |
-| Build zip | Creates `dist/drachometer.zip` containing: `README.md`, `coin.svg`, `hooks/`, `drachometer-install.bat`, `drachometer-install.ps1`, `drachometer-install.py`, `drachometer-install.sh`, `migrations/`, `drachometer-dashboard.html`, `drachometer-serve-report.py`, `drachometer-version.json` |
+| Build zip | Creates `dist/drachometer.zip` containing: `README.md`, `coin.svg`, `hooks/`, `drachometer-install.bat`, `drachometer-install.ps1`, `drachometer-install.py`, `drachometer-install.sh`, `migrations/`, `drachometer-dashboard.html`, `drachometer-serve-report.py`, `drachometer_mesh.py`, `drachometer-version.json` |
 | Upload asset | Attaches the zip to the published release via `softprops/action-gh-release` |
 
 The zip intentionally omits development-only files (`.github/`, `.git/`, `screenshots/`, etc.) so users receive only what is needed to install and run the dashboard.
