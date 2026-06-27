@@ -273,6 +273,27 @@ class TestTwoNodeConvergence(MeshTestBase):
         self.assertEqual(turn_sessions(db_b), all_sessions)
         self.assertEqual(event_count(db_a), event_count(db_b))
 
+        def turn_rows(path: Path):
+            conn = sqlite3.connect(path)
+            try:
+                return conn.execute(
+                    "SELECT session_id, turn_id, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens FROM turns ORDER BY session_id, turn_id"
+                ).fetchall()
+            finally:
+                conn.close()
+
+        def tool_rows(path: Path):
+            conn = sqlite3.connect(path)
+            try:
+                return conn.execute(
+                    "SELECT uid, session_id, turn_id, tool_name, exit_code, error FROM tool_calls ORDER BY uid"
+                ).fetchall()
+            finally:
+                conn.close()
+
+        self.assertEqual(turn_rows(db_a), turn_rows(db_b))
+        self.assertEqual(tool_rows(db_a), tool_rows(db_b))
+
         # Second round converges with nothing new to apply.
         mesh.DB_PATH = db_a
         self.assertEqual(mesh.sync_with_peer(cfg_a, f"127.0.0.1:{port_b}"), 0)
