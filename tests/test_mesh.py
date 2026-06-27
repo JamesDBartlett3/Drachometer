@@ -166,17 +166,23 @@ class MeshTestBase(unittest.TestCase):
         pass_fds = []
         if listen_socket is not None:
             fd = listen_socket.fileno()
-            os.set_inheritable(fd, True)
+            if os.name != 'nt':
+                os.set_inheritable(fd, True)
+                pass_fds.append(fd)
             env["MESH_LISTEN_FD"] = str(fd)
-            pass_fds.append(fd)
+        
+        kwargs = {}
+        if os.name != 'nt':
+            kwargs['pass_fds'] = pass_fds
+        else:
+            kwargs['close_fds'] = False
+
         proc = subprocess.Popen(
             [sys.executable, "-c", self._mesh_server_script(db_path, config_path, log_path)],
             cwd=str(Path(__file__).resolve().parent.parent),
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
+            start_new_session=True if os.name != 'nt' else False,
             env=env,
-            pass_fds=pass_fds,
+            **kwargs
         )
         self.addCleanup(self._terminate_process, proc)
         deadline = time.monotonic() + 15
