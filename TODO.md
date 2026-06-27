@@ -13,14 +13,14 @@
     - [x] Define replication identity and idempotency rules so every change has a globally unique event ID and can be safely applied multiple times. _(content-hash `event_id`; `INSERT OR IGNORE`; `tool_calls.uid`.)_
     - [x] Implement anti-entropy reconciliation so nodes periodically compare state summaries and request missing history until convergence. _(per-origin digest → id-diff → fetch-missing loop.)_
     - [x] Add bootstrap and recovery workflows so new or stale nodes can perform full snapshot sync followed by incremental catch-up. _(empty-oplog pull = full snapshot; backfill of pre-mesh history; subsequent rounds catch up.)_
-- [ ] Mesh rollout phase 2 (safety, compatibility, and operations)
-    - [ ] Implement a logging mechanism for mesh replication to log outgoing/incoming sync batches, conflicts, dedupe actions, retries, errors, and replication latency.
-    - [ ] Implement a configuration file for mesh nodes, allowing users to customize settings such as node ID, listen address, peer list, replication interval, retry/backoff policy, and logging level.
-    - [ ] Implement schema versioning and migration support for mesh replication. Nodes should reject incompatible replication payloads, advertise schema version during handshake, and provide a migration workflow to rejoin healthy sync state.
-    - [ ] Define conflict resolution semantics (for example, per-table merge rules, deterministic tie-breakers, and tombstone handling) and document behavior.
-    - [ ] Add retention and compaction policies for replicated history and tombstones, including safeguards that prevent premature deletion before cluster convergence.
-    - [ ] Add mesh health metrics and alerts (peer reachability, replication lag, dedupe rate, conflict rate, and failed sync attempts) with operational runbooks.
-- [ ] Mesh rollout phase 3 (performance tuning)
-    - [ ] Implement replication performance optimization (batching, compression, checkpoints/high-water marks, and optional query/result caching where applicable).
-- [ ] Update documentation for phased mesh installation and usage, including LAN/VM networking requirements, firewall setup, recovery procedures, and troubleshooting.
-    - [ ] Document mesh network identifier behavior as accidental-cross-merge prevention for shared LANs (coworkers/roommates), not as cryptographic security.
+- [x] Mesh rollout phase 2 (safety, compatibility, and operations)
+    - [x] Implement a logging mechanism for mesh replication to log outgoing/incoming sync batches, conflicts, dedupe actions, retries, errors, and replication latency.
+    - [x] Implement a configuration file for mesh nodes, allowing users to customize settings such as node ID, listen address, peer list, replication interval, retry/backoff policy, and logging level.
+    - [x] Implement schema versioning and migration support for mesh replication. Nodes should reject incompatible replication payloads, advertise schema version during handshake, and provide a migration workflow to rejoin healthy sync state.
+    - [x] Define conflict resolution semantics (for example, per-table merge rules, deterministic tie-breakers, and tombstone handling) and document behavior.
+    - [x] Add retention and compaction policies for replicated history and tombstones, including safeguards that prevent premature deletion before cluster convergence.
+    - [x] Add mesh health metrics and alerts (peer reachability, replication lag, dedupe rate, conflict rate, and failed sync attempts) with operational runbooks.
+- [x] Mesh rollout phase 3 (performance tuning)
+    - [x] Implement replication performance optimization (batching, compression, checkpoints/high-water marks, and optional query/result caching where applicable).
+- [x] Update documentation for phased mesh installation and usage, including LAN/VM networking requirements, firewall setup, recovery procedures, and troubleshooting.
+    - [x] Document mesh network identifier behavior as accidental-cross-merge prevention for shared LANs (coworkers/roommates), not as cryptographic security.

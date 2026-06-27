@@ -327,8 +327,21 @@ Joining a node that already has history is safe: its existing rows are **backfil
 ```powershell
 python "$HOME/.claude/hooks/drachometer/drachometer_mesh.py" status          # config, oplog counts, peer reachability
 python "$HOME/.claude/hooks/drachometer/drachometer_mesh.py" import OTHER.db  # merge an offline database file
+python "$HOME/.claude/hooks/drachometer/drachometer_mesh.py" compact --dry-run  # preview retention-based oplog compaction
+python "$HOME/.claude/hooks/drachometer/drachometer_mesh.py" migrate         # sync mesh schema metadata after upgrades
 python "$HOME/.claude/hooks/drachometer/drachometer_mesh.py" disable          # stop replicating (history preserved)
 ```
+
+### Phase 2 hardening
+
+The mesh config file (`~/.claude/drachometer-mesh.json`) now supports operational tuning such as:
+
+- `log_level` (`debug`, `info`, `warning`, `error`)
+- `max_retries` and `retry_backoff_seconds` for transient peer failures
+- `retention_days` and `retention_keep_per_origin` for safe oplog compaction
+- `compress_payloads` to reduce the size of replication traffic over the LAN
+
+The status command also reports basic health signals (peer reachability, replication lag, dedupe rate, conflict rate, and failed sync attempts) so you can spot unhealthy peers before they drift too far apart.
 
 ### Firewall
 
