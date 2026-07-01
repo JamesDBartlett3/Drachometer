@@ -580,13 +580,258 @@
           -5px 0 0 rgba(200, 117, 51, 0.25),
           5px 0 0 rgba(200, 117, 51, 0.25) !important;
       }
+
+      /* Hamburger menu */
+      .menu-wrap {
+        position: relative;
+        flex-shrink: 0;
+      }
+      .hamburger {
+        width: 34px;
+        height: 34px;
+        border-radius: 8px;
+        border: 1px solid var(--border);
+        background: var(--surface);
+        color: var(--text);
+        font-size: 18px;
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        transition: background 0.15s;
+      }
+      .hamburger:hover {
+        background: var(--border);
+      }
+      .menu-dropdown {
+        display: none;
+        position: absolute;
+        top: 42px;
+        left: 0;
+        min-width: 240px;
+        background: var(--surface);
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        box-shadow: 0 12px 32px rgba(0, 0, 0, 0.5);
+        padding: 6px;
+        z-index: 1100;
+      }
+      .menu-dropdown.open {
+        display: block;
+      }
+      .menu-item {
+        display: block;
+        width: 100%;
+        text-align: left;
+        padding: 9px 12px;
+        border: none;
+        background: transparent;
+        color: var(--text);
+        font-size: 13px;
+        border-radius: 6px;
+        cursor: pointer;
+      }
+      .menu-item:hover {
+        background: var(--border);
+      }
+
+      /* Header mesh status indicator */
+      .mesh-indicator {
+        display: none;
+        align-items: center;
+        gap: 7px;
+        padding: 4px 10px;
+        border: 1px solid var(--border);
+        border-radius: 999px;
+        background: var(--surface);
+        color: var(--muted);
+        font-size: 12px;
+        cursor: pointer;
+        white-space: nowrap;
+        flex-shrink: 0;
+      }
+      .mesh-indicator.visible {
+        display: inline-flex;
+      }
+      .mesh-indicator:hover {
+        border-color: var(--accent);
+      }
+      .mesh-dot {
+        width: 9px;
+        height: 9px;
+        border-radius: 50%;
+        background: var(--muted);
+        flex-shrink: 0;
+      }
+      .mesh-dot.connected {
+        background: var(--green);
+        box-shadow: 0 0 6px rgba(74, 222, 128, 0.7);
+      }
+      .mesh-sync {
+        display: none;
+        line-height: 1;
+        color: var(--blue);
+      }
+      .mesh-sync.active {
+        display: inline-block;
+        animation: mesh-spin 1s linear infinite;
+      }
+      @keyframes mesh-spin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+      .mesh-outcome {
+        line-height: 1;
+      }
+      .mesh-outcome.ok {
+        color: var(--green);
+      }
+      .mesh-outcome.fail {
+        color: var(--red);
+      }
+      .mesh-peers {
+        color: var(--text);
+      }
+
+      /* Mesh configuration modal */
+      .mesh-section {
+        margin: 18px 0;
+      }
+      .mesh-stat-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+        gap: 12px;
+        margin: 10px 0;
+      }
+      .mesh-stat {
+        background: var(--bg);
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        padding: 10px 12px;
+      }
+      .mesh-stat .label {
+        color: var(--muted);
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+      }
+      .mesh-stat .value {
+        font-size: 17px;
+        font-weight: 600;
+        margin-top: 4px;
+      }
+      .mesh-list {
+        list-style: none;
+        margin: 8px 0;
+        padding: 0;
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        overflow: hidden;
+      }
+      .mesh-list li {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+        padding: 9px 12px;
+        border-bottom: 1px solid var(--border);
+        font-size: 13px;
+      }
+      .mesh-list li:last-child {
+        border-bottom: none;
+      }
+      .mesh-list .muted {
+        color: var(--muted);
+        font-size: 12px;
+      }
+      .mesh-btn {
+        padding: 7px 14px;
+        border-radius: 7px;
+        border: 1px solid var(--accent);
+        background: var(--accent);
+        color: #fff;
+        font-size: 13px;
+        font-weight: 500;
+        cursor: pointer;
+        transition: background 0.15s;
+      }
+      .mesh-btn:hover {
+        background: var(--accent2);
+      }
+      .mesh-btn.secondary {
+        background: transparent;
+        color: var(--text);
+        border-color: var(--border);
+      }
+      .mesh-btn.secondary:hover {
+        background: var(--border);
+      }
+      .mesh-btn.danger {
+        background: transparent;
+        color: var(--red);
+        border-color: var(--red);
+      }
+      .mesh-btn.danger:hover {
+        background: rgba(248, 113, 113, 0.12);
+      }
+      .mesh-btn:disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
+      }
+      .mesh-input {
+        padding: 7px 10px;
+        border-radius: 7px;
+        border: 1px solid var(--border);
+        background: var(--bg);
+        color: var(--text);
+        font-size: 13px;
+        font-family: inherit;
+      }
+      .mesh-row {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 8px;
+        margin-top: 8px;
+      }
+      .mesh-msg {
+        font-size: 13px;
+        margin-top: 10px;
+      }
+      .mesh-msg.error {
+        color: var(--red);
+      }
+      .mesh-msg.info {
+        color: var(--muted);
+      }
     </style>
   </head>
 
   <body>
     <header>
+      <div class="menu-wrap">
+        <button id="hamburger-btn" class="hamburger" aria-label="Open menu" aria-haspopup="true" aria-expanded="false">&#9776;</button>
+        <div id="app-menu" class="menu-dropdown" role="menu">
+          <button id="menu-mesh" class="menu-item" role="menuitem">
+            Configure Local Mesh Network
+          </button>
+        </div>
+      </div>
       <img src="coin.svg" alt="coin" class="coin-logo" />
       <h1>Drachometer</h1>
+      <button
+        id="mesh-indicator"
+        class="mesh-indicator"
+        type="button"
+        title="Local mesh network — click to configure"
+        aria-label="Local mesh network status"
+      >
+        <span class="mesh-dot" id="mesh-dot"></span>
+        <span class="mesh-sync" id="mesh-sync" title="Syncing">&#10227;</span>
+        <span class="mesh-outcome" id="mesh-outcome"></span>
+        <span class="mesh-peers" id="mesh-peers">0 peers connected</span>
+      </button>
       <div class="date-slicer" id="date-slicer">
         <button class="readme-btn" id="readme-btn">README</button>
         <button class="active" data-range="all">All</button>
@@ -614,6 +859,16 @@
           <button class="modal-close" id="readme-close">&times;</button>
         </div>
         <div class="modal-body" id="readme-body"></div>
+      </div>
+    </div>
+
+    <div class="modal-overlay" id="mesh-modal">
+      <div class="modal">
+        <div class="modal-header">
+          <h2>Local Mesh Network</h2>
+          <button class="modal-close" id="mesh-close">&times;</button>
+        </div>
+        <div class="modal-body" id="mesh-body"></div>
       </div>
     </div>
 
@@ -2078,9 +2333,438 @@
           readmeModal.classList.remove("open");
       });
 
+      // --- Hamburger menu + Local Mesh Network configuration ---
+      const appMenu = document.getElementById("app-menu");
+      const hamburgerBtn = document.getElementById("hamburger-btn");
+      const meshModal = document.getElementById("mesh-modal");
+      const meshBody = document.getElementById("mesh-body");
+      const meshIndicator = document.getElementById("mesh-indicator");
+
+      let meshUI = { status: null, scan: null, scanning: false, message: null, busy: false };
+
+      function closeMenu() {
+        appMenu.classList.remove("open");
+        hamburgerBtn.setAttribute("aria-expanded", "false");
+      }
+      hamburgerBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        const open = appMenu.classList.toggle("open");
+        hamburgerBtn.setAttribute("aria-expanded", String(open));
+      });
+      document.addEventListener("click", (e) => {
+        if (!appMenu.contains(e.target) && e.target !== hamburgerBtn) closeMenu();
+      });
+      document
+        .getElementById("menu-mesh")
+        .addEventListener("click", () => {
+          closeMenu();
+          openMeshModal();
+        });
+
+      function meshFmtDuration(s) {
+        if (s === null || s === undefined) return "\u2014";
+        s = Math.floor(s);
+        const d = Math.floor(s / 86400);
+        const h = Math.floor((s % 86400) / 3600);
+        const m = Math.floor((s % 3600) / 60);
+        const sec = s % 60;
+        if (d > 0) return `${d}d ${h}h ${m}m`;
+        if (h > 0) return `${h}h ${m}m`;
+        if (m > 0) return `${m}m ${sec}s`;
+        return `${sec}s`;
+      }
+      function meshFmtProp(s) {
+        if (s === null || s === undefined) return "\u2014";
+        if (s < 1) return `${Math.round(s * 1000)} ms`;
+        return `${s.toFixed(1)} s`;
+      }
+
+      async function meshFetchStatus() {
+        try {
+          const resp = await fetch("/mesh/api/status", { cache: "no-store" });
+          if (!resp.ok) return null;
+          return await resp.json();
+        } catch {
+          return null;
+        }
+      }
+      async function meshPost(path, body) {
+        const resp = await fetch(path, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body || {}),
+        });
+        return resp.json();
+      }
+      async function meshScan() {
+        try {
+          const resp = await fetch("/mesh/api/scan", { cache: "no-store" });
+          if (!resp.ok) return null;
+          return await resp.json();
+        } catch {
+          return null;
+        }
+      }
+
+      function updateMeshIndicator(status) {
+        meshUI.status = status;
+        const enabled = status && status.available !== false && status.enabled;
+        if (!enabled) {
+          meshIndicator.classList.remove("visible");
+          return;
+        }
+        meshIndicator.classList.add("visible");
+        const dot = document.getElementById("mesh-dot");
+        const sync = document.getElementById("mesh-sync");
+        const outcome = document.getElementById("mesh-outcome");
+        const peers = document.getElementById("mesh-peers");
+        dot.classList.toggle("connected", !!status.connected);
+        sync.classList.toggle("active", !!status.syncing);
+        outcome.classList.remove("ok", "fail");
+        if (status.last_sync_ok === true) {
+          outcome.textContent = "\u2713";
+          outcome.classList.add("ok");
+        } else if (status.last_sync_ok === false) {
+          outcome.textContent = "\u2717";
+          outcome.classList.add("fail");
+        } else {
+          outcome.textContent = "";
+        }
+        const n = status.peer_count || 0;
+        peers.textContent = `${n} peer${n === 1 ? "" : "s"} connected`;
+      }
+
+      meshIndicator.addEventListener("click", openMeshModal);
+
+      async function openMeshModal() {
+        meshModal.classList.add("open");
+        meshUI.message = null;
+        meshUI.status = await meshFetchStatus();
+        renderMeshBody();
+        // Kick off a subnet scan (may take a moment).
+        meshUI.scanning = true;
+        renderMeshBody();
+        meshUI.scan = await meshScan();
+        meshUI.scanning = false;
+        renderMeshBody();
+      }
+
+      function meshCloseModal() {
+        meshModal.classList.remove("open");
+      }
+      document
+        .getElementById("mesh-close")
+        .addEventListener("click", meshCloseModal);
+      meshModal.addEventListener("click", (e) => {
+        if (e.target === meshModal) meshCloseModal();
+      });
+      document.addEventListener("keydown", (e) => {
+        if (e.key === "Escape" && meshModal.classList.contains("open"))
+          meshCloseModal();
+      });
+
+      function renderMeshBody() {
+        const s = meshUI.status;
+        if (!s) {
+          meshBody.innerHTML =
+            '<p class="mesh-msg info">The mesh control API is unavailable. The dashboard must be served by the local Drachometer server (http://localhost:9873) to configure a mesh network.</p>';
+          return;
+        }
+        if (s.available === false) {
+          meshBody.innerHTML =
+            '<p class="mesh-msg info">Mesh support is not available in this installation.</p>';
+          return;
+        }
+        let html = "";
+        if (meshUI.message) {
+          html += `<p class="mesh-msg ${meshUI.message.type}">${esc(
+            meshUI.message.text,
+          )}</p>`;
+        }
+
+        // Current mesh panel
+        if (s.enabled) {
+          const dotClass = s.connected ? "connected" : "";
+          html += `<div class="mesh-section">
+            <h2>Current mesh</h2>
+            <div class="mesh-row" style="align-items:center">
+              <span class="mesh-dot ${dotClass}"></span>
+              <strong>Mesh ID</strong>
+            </div>
+            <div class="mesh-row" style="margin-top:8px">
+              <input class="mesh-input" value="${esc(s.mesh_id || "")}" readonly
+                title="Current mesh ID" onclick="this.select()" style="width:100%" />
+            </div>
+            <div class="mesh-stat-grid">
+              <div class="mesh-stat"><div class="label">Connection</div><div class="value">${
+                s.connected ? "Connected" : "No active peers"
+              }</div></div>
+              <div class="mesh-stat"><div class="label">Peers connected</div><div class="value">${
+                s.peer_count || 0
+              }</div></div>
+              <div class="mesh-stat"><div class="label">Uptime</div><div class="value">${meshFmtDuration(
+                s.uptime_seconds,
+              )}</div></div>
+              <div class="mesh-stat"><div class="label">Mean propagation</div><div class="value">${meshFmtProp(
+                s.mean_propagation_seconds,
+              )}</div></div>
+            </div>`;
+
+          const peers = s.active_peers || [];
+          html += `<h3>Active peers</h3>`;
+          if (peers.length) {
+            html += `<ul class="mesh-list">${peers
+              .map(
+                (p) =>
+                  `<li><span>${esc(p.advertise || "")}</span><span class="muted">${esc(
+                    (p.node_id || "").slice(0, 12),
+                  )}</span></li>`,
+              )
+              .join("")}</ul>`;
+          } else {
+            html += `<p class="mesh-msg info">No other active nodes on this mesh yet.</p>`;
+          }
+
+          const adjacent = s.adjacent_meshes || [];
+          html += `<h3>Adjacent mesh networks</h3>`;
+          if (adjacent.length) {
+            html += `<ul class="mesh-list">${adjacent
+              .map(
+                (m) =>
+                  `<li><span>${esc(m.name)}-${"\u2022".repeat(
+                    (m.suffix || "").length || 8,
+                  )}</span><span class="muted">${
+                    m.node_count
+                  } node(s)</span></li>`,
+              )
+              .join("")}</ul>`;
+          } else {
+            html += `<p class="mesh-msg info">${
+              meshUI.scanning
+                ? "Scanning local subnets\u2026"
+                : "No adjacent mesh networks with active nodes were found."
+            }</p>`;
+          }
+
+          html += `<div class="mesh-row">
+            <button class="mesh-btn danger" id="mesh-leave-btn">Leave this mesh</button>
+            <button class="mesh-btn secondary" id="mesh-rescan-btn">${
+              meshUI.scanning ? "Scanning\u2026" : "Rescan"
+            }</button>
+          </div></div>`;
+        }
+
+        // Discovered meshes (join). Only one mesh at a time, so joining leaves the current one.
+        html += `<div class="mesh-section"><h2>${
+          s.enabled ? "Switch to a discovered mesh" : "Discovered mesh networks"
+        }</h2>`;
+        const discovered = (meshUI.scan && meshUI.scan.meshes
+          ? meshUI.scan.meshes
+          : []
+        ).filter((m) => !m.is_current);
+        html += `<p class="mesh-msg info">Scanned ${
+          meshUI.scan ? meshUI.scan.scanned_hosts : 0
+        } host(s) across ${
+          meshUI.scan && meshUI.scan.subnets ? meshUI.scan.subnets.length : 0
+        } subnet(s). To join, enter the segment of the mesh name after the final dash.</p>`;
+        if (meshUI.scanning) {
+          html += `<p class="mesh-msg info">Scanning local subnets\u2026</p>`;
+        } else if (discovered.length) {
+          html += `<ul class="mesh-list">${discovered
+            .map((m, i) => {
+              const peers = (m.nodes || [])
+                .map((n) => n.advertise)
+                .filter(Boolean)
+                .join(",");
+              return `<li>
+                <div>
+                  <div><strong>${esc(m.name)}</strong>-${"\u2022".repeat(
+                    (m.suffix || "").length || 8,
+                  )}</div>
+                  <div class="muted">${m.node_count} active node(s)</div>
+                </div>
+                <div class="mesh-row" style="margin-top:0">
+                  <input class="mesh-input mesh-join-suffix" data-idx="${i}" style="width:120px"
+                    placeholder="suffix" />
+                  <button class="mesh-btn mesh-join-btn" data-idx="${i}"
+                    data-name="${esc(m.name)}" data-suffix="${esc(m.suffix)}"
+                    data-peers="${esc(peers)}">Join</button>
+                </div>
+              </li>`;
+            })
+            .join("")}</ul>`;
+        } else {
+          html += `<p class="mesh-msg info">No other mesh networks found on your local subnets.</p>`;
+        }
+        if (!s.enabled) {
+          html += `<div class="mesh-row">
+            <button class="mesh-btn secondary" id="mesh-rescan-btn">${
+              meshUI.scanning ? "Scanning\u2026" : "Rescan"
+            }</button>
+          </div>`;
+        }
+        html += `</div>`;
+
+        // Manual join (for meshes on other subnets)
+        html += `<div class="mesh-section"><h2>Join by mesh id</h2>
+          <p class="mesh-msg info">Know the full mesh id and a peer address? Join directly.</p>
+          <div class="mesh-row">
+            <input class="mesh-input" id="mesh-manual-id" placeholder="name-abcd1234" style="width:180px" />
+            <input class="mesh-input" id="mesh-manual-peer" placeholder="192.168.1.10:9874" style="width:180px" />
+            <button class="mesh-btn" id="mesh-manual-join">Join</button>
+          </div></div>`;
+
+        // Create new mesh
+        html += `<div class="mesh-section"><h2>Create a new mesh network</h2>
+          <p class="mesh-msg info">Start a fresh mesh on this machine. Other nodes can then discover and join it.</p>
+          <div class="mesh-row">
+            <input class="mesh-input" id="mesh-create-name" placeholder="mesh name (e.g. home)" style="width:200px" />
+            <button class="mesh-btn" id="mesh-create-btn">Create</button>
+          </div></div>`;
+
+        meshBody.innerHTML = html;
+        wireMeshButtons();
+      }
+
+      function meshSetBusy(busy) {
+        meshUI.busy = busy;
+        meshBody
+          .querySelectorAll("button.mesh-btn")
+          .forEach((b) => (b.disabled = busy));
+      }
+
+      async function meshDoAction(fn) {
+        if (meshUI.busy) return;
+        meshSetBusy(true);
+        meshUI.message = null;
+        try {
+          const result = await fn();
+          if (result && result.ok === false) {
+            meshUI.message = {
+              type: "error",
+              text: result.error || "Operation failed.",
+            };
+          }
+        } catch (err) {
+          meshUI.message = { type: "error", text: String(err) };
+        }
+        meshUI.status = await meshFetchStatus();
+        updateMeshIndicator(meshUI.status);
+        meshSetBusy(false);
+        renderMeshBody();
+        // refresh discovery after a membership change
+        meshUI.scanning = true;
+        renderMeshBody();
+        meshUI.scan = await meshScan();
+        meshUI.scanning = false;
+        renderMeshBody();
+      }
+
+      function wireMeshButtons() {
+        const rescan = document.getElementById("mesh-rescan-btn");
+        if (rescan)
+          rescan.addEventListener("click", async () => {
+            meshUI.scanning = true;
+            renderMeshBody();
+            meshUI.scan = await meshScan();
+            meshUI.scanning = false;
+            renderMeshBody();
+          });
+
+        const leave = document.getElementById("mesh-leave-btn");
+        if (leave)
+          leave.addEventListener("click", () => {
+            if (
+              !confirm(
+                "Leave this mesh network? Your local history is preserved, but this node will stop syncing with peers.",
+              )
+            )
+              return;
+            meshDoAction(() => meshPost("/mesh/api/leave", {}));
+          });
+
+        meshBody.querySelectorAll(".mesh-join-btn").forEach((btn) => {
+          btn.addEventListener("click", () => {
+            const name = btn.dataset.name;
+            const suffix = btn.dataset.suffix;
+            const peers = (btn.dataset.peers || "")
+              .split(",")
+              .filter(Boolean);
+            const input = meshBody.querySelector(
+              `.mesh-join-suffix[data-idx="${btn.dataset.idx}"]`,
+            );
+            const entered = (input.value || "").trim();
+            if (!entered) {
+              meshUI.message = {
+                type: "error",
+                text: "Enter the mesh name segment after the final dash to join.",
+              };
+              renderMeshBody();
+              return;
+            }
+            if (entered !== suffix) {
+              meshUI.message = {
+                type: "error",
+                text: "That segment does not match this mesh network.",
+              };
+              renderMeshBody();
+              return;
+            }
+            meshDoAction(() =>
+              meshPost("/mesh/api/join", {
+                mesh_id: `${name}-${entered}`,
+                peers,
+              }),
+            );
+          });
+        });
+
+        const manualJoin = document.getElementById("mesh-manual-join");
+        if (manualJoin)
+          manualJoin.addEventListener("click", () => {
+            const id = document
+              .getElementById("mesh-manual-id")
+              .value.trim();
+            const peer = document
+              .getElementById("mesh-manual-peer")
+              .value.trim();
+            if (!id) {
+              meshUI.message = { type: "error", text: "Enter a mesh id to join." };
+              renderMeshBody();
+              return;
+            }
+            meshDoAction(() =>
+              meshPost("/mesh/api/join", {
+                mesh_id: id,
+                peers: peer ? [peer] : [],
+              }),
+            );
+          });
+
+        const createBtn = document.getElementById("mesh-create-btn");
+        if (createBtn)
+          createBtn.addEventListener("click", () => {
+            const name =
+              document.getElementById("mesh-create-name").value.trim() || "mesh";
+            meshDoAction(() => meshPost("/mesh/api/create", { name }));
+          });
+      }
+
+      async function initMesh() {
+        const status = await meshFetchStatus();
+        updateMeshIndicator(status);
+        setInterval(async () => {
+          const st = await meshFetchStatus();
+          updateMeshIndicator(st);
+          // The modal is only re-rendered on open, rescan, or after an action so
+          // that live polling never clobbers text the user is typing into a form.
+        }, 3000);
+      }
+
       // --- Init ---
       restoreSlicer();
       checkForUpdates();
+      initMesh();
 
       (async () => {
         try {

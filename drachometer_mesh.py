@@ -8,11 +8,13 @@ is a no-op. Nodes gossip over plain stdlib HTTP using pull-based anti-entropy
 (compare per-origin digests, fetch the events you are missing): no broker, no
 third-party dependencies.
 
-Scope is deliberately limited to LAN/VM networks. The mesh identifier
-(``<name>-<8 hex>``) prevents *accidental* cross-merges between unrelated meshes
-that happen to share a LAN (coworkers, roommates); it is **not** a security
-boundary -- there is no authentication and no TLS. Do not expose mesh ports to
-the public internet.
+Scope is deliberately limited to LAN/VM networks. Most mesh endpoints require
+callers to present the mesh identifier (``<name>-<8 hex>``), which acts only
+as a lightweight shared-secret gate to prevent accidental or casual
+cross-mesh merges on a shared LAN (coworkers, roommates). Discovery keeps one
+anonymous, read-only probe so nodes can advertise which mesh they belong to.
+This is **not** robust authentication and there is still no TLS, so do not
+expose mesh ports to the public internet.
 
 This file is both an importable library (the hook and the dashboard server import
 it) and a CLI for setup and maintenance::
@@ -35,15 +37,21 @@ from __future__ import annotations
 import argparse
 import gzip
 import hashlib
+import ipaddress
 import json
+import platform
 import re
 import socket
 import sqlite3
+import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 import urllib.request
 import uuid
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -66,6 +74,13 @@ DEFAULT_RETENTION_DAYS = 0
 DEFAULT_RETENTION_KEEP_PER_ORIGIN = 50
 DEFAULT_COMPRESS_PAYLOADS = True
 
+# Local mesh discovery / runtime dashboard-control defaults.
+DISCOVERY_TIMEOUT = 0.35        # per-host probe timeout (seconds)
+DISCOVERY_MAX_WORKERS = 128     # concurrent probes during a subnet scan
+DISCOVERY_MAX_HOSTS = 4096      # safety cap on total hosts scanned per request
+PROPAGATION_WINDOW = 15         # rolling window of records for mean propagation time
+PEER_ACTIVE_TTL = 45            # seconds a peer stays "active" after last successful contact
+
 # Serializes oplog application *within* this process; WAL + busy_timeout handle
 # cross-process contention (the hook writes from a separate process).
 _APPLY_LOCK = threading.Lock()
@@ -81,6 +96,25 @@ _METRICS = {
 }
 
 _LOG_LEVEL_CACHE: tuple[int | None, int | None, str] | None = None
+
+
+# --------------------------------------------------------------------------- #
+# Runtime state (dashboard-controlled mesh: live status, uptime, propagation)
+# --------------------------------------------------------------------------- #
+_RUNTIME_LOCK = threading.RLock()
+_RUNTIME: dict = {
+    "server": None,             # the live _ThreadingHTTPServer, if any
+    "stop_event": None,         # threading.Event used to stop the gossip daemon
+    "app_version": "",
+    "started_at": None,         # epoch seconds when the current mesh came up
+    "syncing": False,           # True while a gossip round is in flight
+    "last_sync_ok": None,       # bool | None -- outcome of the most recent round
+    "last_sync_at": None,       # ISO timestamp of the most recent round
+    "active_peers": {},         # advertise-addr -> {"last_seen": epoch, "node_id": str}
+    "prop_seconds": deque(maxlen=PROPAGATION_WINDOW),  # recent propagation times
+    "prop_recorded": set(),     # event_ids already counted toward propagation
+    "last_scan": None,          # cached discover_meshes() result
+}
 
 
 # --------------------------------------------------------------------------- #
@@ -294,10 +328,15 @@ def collect_health_metrics(cfg: dict | None = None, db_path: Path | None = None)
     cfg = normalize_config(cfg or load_config() or {}) or {}
     peers = cfg.get("peers") or []
     reachable = 0
+    mesh_id = cfg.get("mesh_id")
     for peer in peers:
+        if not mesh_id:
+            continue
         try:
-            _get_json(peer, "/mesh/hello", timeout=1.0)
+            hello = _get_json(peer, _mesh_path("/mesh/hello", mesh_id), timeout=1.0)
         except Exception:
+            continue
+        if not hello.get("ok"):
             continue
         reachable += 1
     with _db(db_path) as conn:
@@ -767,26 +806,49 @@ def _make_mesh_handler(cfg: dict, registry: _PeerRegistry, app_version: str,
             self.end_headers()
             self.wfile.write(body)
 
+        def _mesh_authorized(self, presented_mesh_id: str | None) -> bool:
+            return bool(presented_mesh_id) and presented_mesh_id == cfg.get("mesh_id")
+
+        def _require_mesh_id(self, presented_mesh_id: str | None) -> bool:
+            if self._mesh_authorized(presented_mesh_id):
+                return True
+            self._send_json({"error": "mesh mismatch"}, status=403)
+            return False
+
         def do_GET(self):  # noqa: N802
             path, _, query = self.path.partition("?")
-            params = dict(p.split("=", 1) for p in query.split("&") if "=" in p)
-            if path == "/mesh/hello":
+            params = dict(urllib.parse.parse_qsl(query, keep_blank_values=True))
+            if path == "/mesh/discover":
                 self._send_json({
-                    "mesh_id": cfg["mesh_id"],
+                    "ok": bool(cfg.get("enabled") and cfg.get("mesh_id") and cfg.get("node_id")),
+                    "mesh_id": cfg.get("mesh_id"),
+                    "node_id": cfg.get("node_id"),
+                    "schema_version": int(cfg.get("schema_version", SCHEMA_VERSION)),
+                })
+            elif path == "/mesh/hello":
+                if not self._mesh_authorized(params.get("mesh_id")):
+                    self._send_json({"ok": False, "mesh_id_match": False})
+                    return
+                self._send_json({
+                    "ok": True,
+                    "mesh_id_match": True,
                     "node_id": cfg["node_id"],
                     "schema_version": int(cfg.get("schema_version", SCHEMA_VERSION)),
                     "app_version": app_version,
                     "migration_note": "upgrade both nodes to the same release and re-run 'python drachometer_mesh.py migrate' if schema versions differ",
                 })
             elif path == "/mesh/digest":
+                if not self._require_mesh_id(params.get("mesh_id")):
+                    return
                 with _db(db_path) as conn:
                     origins = local_origin_counts(conn)
                 self._send_json({
-                    "mesh_id": cfg["mesh_id"],
                     "schema_version": SCHEMA_VERSION,
                     "origins": origins,
                 })
             elif path == "/mesh/event-ids":
+                if not self._require_mesh_id(params.get("mesh_id")):
+                    return
                 origin = params.get("origin", "")
                 with _db(db_path) as conn:
                     ids = [r[0] for r in conn.execute(
@@ -806,6 +868,8 @@ def _make_mesh_handler(cfg: dict, registry: _PeerRegistry, app_version: str,
                 self._send_json({"error": "bad json"}, status=400)
                 return
             if path == "/mesh/events":
+                if not self._require_mesh_id(body.get("mesh_id")):
+                    return
                 ids = body.get("ids") or []
                 qmarks = ",".join("?" * len(ids))
                 events = []
@@ -824,11 +888,13 @@ def _make_mesh_handler(cfg: dict, registry: _PeerRegistry, app_version: str,
                             })
                 self._send_json({"events": events})
             elif path == "/mesh/announce":
+                if not self._require_mesh_id(body.get("mesh_id")):
+                    return
                 # Startup registration: a peer tells us how to reach it.
                 advertise = body.get("advertise")
-                if body.get("mesh_id") == cfg["mesh_id"] and advertise:
+                if advertise:
                     registry.add(advertise)
-                self._send_json({"ok": True, "mesh_id": cfg["mesh_id"]})
+                self._send_json({"ok": True})
             else:
                 self._send_json({"error": "not found"}, status=404)
 
@@ -891,6 +957,12 @@ def _chunks(seq, size):
         yield seq[i:i + size]
 
 
+def _mesh_path(path: str, mesh_id: str, **params) -> str:
+    query = {"mesh_id": mesh_id}
+    query.update({key: value for key, value in params.items() if value is not None})
+    return f"{path}?{urllib.parse.urlencode(query)}"
+
+
 def sync_with_peer(cfg: dict, peer: str) -> int:
     """Pull every event this node is missing from one peer. Returns count applied."""
     cfg = normalize_config(cfg) or {}
@@ -900,14 +972,13 @@ def sync_with_peer(cfg: dict, peer: str) -> int:
     started = time.monotonic()
     for attempt in range(1, attempts + 1):
         try:
-            hello = _get_json(peer, "/mesh/hello")
-            if hello.get("mesh_id") != cfg["mesh_id"]:
+            hello = _get_json(peer, _mesh_path("/mesh/hello", cfg["mesh_id"]))
+            if not hello.get("ok"):
                 log(
                     "skip peer due to mesh id mismatch",
                     level="warning",
                     event="mesh_mismatch",
                     peer=peer,
-                    remote_mesh_id=hello.get("mesh_id"),
                     local_mesh_id=cfg.get("mesh_id"),
                 )
                 return 0
@@ -924,14 +995,16 @@ def sync_with_peer(cfg: dict, peer: str) -> int:
                 )
                 return 0
 
-            remote = _get_json(peer, "/mesh/digest")
+            remote = _get_json(peer, _mesh_path("/mesh/digest", cfg["mesh_id"]))
             with _db() as conn:
                 local_counts = local_origin_counts(conn)
             applied = 0
             for origin, remote_count in (remote.get("origins") or {}).items():
                 if local_counts.get(origin, 0) >= remote_count:
                     continue
-                remote_ids = _get_json(peer, f"/mesh/event-ids?origin={origin}").get("ids", [])
+                remote_ids = _get_json(
+                    peer, _mesh_path("/mesh/event-ids", cfg["mesh_id"], origin=origin)
+                ).get("ids", [])
                 with _db() as conn:
                     have = {
                         r[0] for r in conn.execute(
@@ -940,7 +1013,9 @@ def sync_with_peer(cfg: dict, peer: str) -> int:
                     }
                 missing = [i for i in remote_ids if i not in have]
                 for batch in _chunks(missing, int(cfg.get("fetch_batch_size", FETCH_BATCH))):
-                    events = _post_json(peer, "/mesh/events", {"ids": batch}).get("events", [])
+                    events = _post_json(
+                        peer, "/mesh/events", {"mesh_id": cfg["mesh_id"], "ids": batch}
+                    ).get("events", [])
                     log(
                         "pulling sync batch",
                         level="debug",
@@ -995,11 +1070,25 @@ def sync_with_peer(cfg: dict, peer: str) -> int:
 
 def sync_round(cfg: dict, registry: _PeerRegistry) -> int:
     total = 0
-    for peer in registry.all():
+    with _RUNTIME_LOCK:
+        _RUNTIME["syncing"] = True
+    ok = True
+    try:
+        for peer in registry.all():
+            try:
+                total += sync_with_peer(cfg, peer)
+            except Exception as exc:  # network/peer errors are expected and non-fatal
+                ok = False
+                log(f"sync error {peer}: {exc}")
         try:
-            total += sync_with_peer(cfg, peer)
-        except Exception as exc:  # network/peer errors are expected and non-fatal
-            log(f"sync error {peer}: {exc}")
+            _update_liveness_and_propagation(cfg, registry)
+        except Exception as exc:  # liveness probing is best-effort
+            log(f"liveness error: {exc}", level="warning")
+    finally:
+        with _RUNTIME_LOCK:
+            _RUNTIME["syncing"] = False
+            _RUNTIME["last_sync_ok"] = ok
+            _RUNTIME["last_sync_at"] = datetime.now(timezone.utc).isoformat()
     return total
 
 
@@ -1018,11 +1107,14 @@ def start_mesh(app_version: str = "", db_path: Path | None = None, inherited_soc
     """Start the mesh HTTP server and gossip daemon if mesh is enabled.
 
     Returns True if mesh was started. Safe to call from the dashboard server; all
-    work happens on daemon threads.
+    work happens on daemon threads. Any previously-running mesh (started in this
+    process) is stopped first so create/join/leave can reconfigure at runtime.
     """
     cfg = load_config()
     if not (cfg and cfg.get("enabled") and cfg.get("mesh_id") and cfg.get("node_id")):
         return False
+
+    stop_mesh()  # tear down any prior in-process mesh before rebinding
 
     with _db(db_path) as conn:
         ensure_schema(conn)
@@ -1040,15 +1132,532 @@ def start_mesh(app_version: str = "", db_path: Path | None = None, inherited_soc
     threading.Thread(target=server.serve_forever, daemon=True).start()
     log(f"mesh server listening on {host}:{port} (mesh_id={cfg['mesh_id']})")
 
+    stop_event = threading.Event()
+    with _RUNTIME_LOCK:
+        _RUNTIME["server"] = server
+        _RUNTIME["stop_event"] = stop_event
+        _RUNTIME["app_version"] = app_version
+        _RUNTIME["started_at"] = time.time()
+        _RUNTIME["active_peers"] = {}
+        _RUNTIME["prop_seconds"] = deque(maxlen=PROPAGATION_WINDOW)
+        _RUNTIME["prop_recorded"] = set()
+
     def _daemon():
         _announce(cfg, registry)  # startup registration
         interval = int(cfg.get("sync_interval_seconds", DEFAULT_SYNC_INTERVAL))
-        while True:
+        while not stop_event.is_set():
             sync_round(cfg, registry)
-            time.sleep(interval)
+            stop_event.wait(interval)
 
     threading.Thread(target=_daemon, daemon=True).start()
     return True
+
+
+def stop_mesh() -> bool:
+    """Stop the in-process mesh server and gossip daemon, if running.
+
+    Returns True if something was stopped. Replication history is untouched.
+    """
+    with _RUNTIME_LOCK:
+        server = _RUNTIME.get("server")
+        stop_event = _RUNTIME.get("stop_event")
+        _RUNTIME["server"] = None
+        _RUNTIME["stop_event"] = None
+        _RUNTIME["started_at"] = None
+        _RUNTIME["syncing"] = False
+        _RUNTIME["active_peers"] = {}
+    if stop_event is not None:
+        stop_event.set()
+    if server is not None:
+        try:
+            server.shutdown()
+        except Exception:
+            pass
+        try:
+            server.server_close()
+        except Exception:
+            pass
+        log("mesh server stopped")
+        return True
+    return False
+
+
+# --------------------------------------------------------------------------- #
+# Local subnet discovery + live status (dashboard-driven configuration)
+# --------------------------------------------------------------------------- #
+def list_local_ipv4s() -> list[str]:
+    """Best-effort set of this host's non-loopback IPv4 addresses across NICs.
+
+    Used only as a fallback when the OS network tools cannot be queried for the
+    real per-interface netmask (see :func:`list_local_interfaces`).
+    """
+    ips: set[str] = set()
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            addr = info[4][0]
+            if addr:
+                ips.add(addr)
+    except OSError:
+        pass
+    primary = detect_lan_ip()
+    if primary:
+        ips.add(primary)
+    return sorted(ip for ip in ips if not ipaddress.ip_address(ip).is_loopback)
+
+
+def _netmask_to_prefix(mask: str) -> int | None:
+    """Convert a netmask to a prefix length.
+
+    Accepts a dotted-quad (``255.255.255.0``), a hex mask (``0xffffff00``) as
+    printed by BSD/macOS ``ifconfig``, or a bare prefix (``24``).
+    """
+    mask = (mask or "").strip()
+    if not mask:
+        return None
+    try:
+        if mask.lower().startswith("0x"):
+            dotted = str(ipaddress.IPv4Address(int(mask, 16)))
+        elif "." in mask:
+            dotted = mask
+        else:
+            prefix = int(mask)
+            return prefix if 0 <= prefix <= 32 else None
+        return ipaddress.IPv4Network(f"0.0.0.0/{dotted}").prefixlen
+    except (ValueError, ipaddress.AddressValueError, ipaddress.NetmaskValueError):
+        return None
+
+
+def _parse_ip_addr_output(text: str) -> list[tuple[str, int]]:
+    """Parse ``ip -o -f inet addr show`` (Linux iproute2) output.
+
+    Each address already carries its prefix, e.g. ``inet 192.168.1.50/24``.
+    """
+    out: list[tuple[str, int]] = []
+    for match in re.finditer(r"inet (\d+\.\d+\.\d+\.\d+)/(\d+)", text):
+        out.append((match.group(1), int(match.group(2))))
+    return out
+
+
+def _parse_ifconfig_output(text: str) -> list[tuple[str, int]]:
+    """Parse ``ifconfig`` output (BSD/macOS hex masks or Linux dotted masks)."""
+    out: list[tuple[str, int]] = []
+    pattern = re.compile(
+        r"inet (?:addr:)?(\d+\.\d+\.\d+\.\d+).*?"
+        r"(?:netmask|Mask:?)\s*(0x[0-9a-fA-F]+|\d+\.\d+\.\d+\.\d+)",
+        re.IGNORECASE,
+    )
+    for match in pattern.finditer(text):
+        prefix = _netmask_to_prefix(match.group(2))
+        if prefix is not None:
+            out.append((match.group(1), prefix))
+    return out
+
+
+def _parse_windows_ipconfig_output(text: str) -> list[tuple[str, int]]:
+    """Parse Windows ``ipconfig`` output, pairing each IPv4 with its subnet mask."""
+    out: list[tuple[str, int]] = []
+    pending_ip: str | None = None
+    for line in text.splitlines():
+        ipv4 = re.search(r"IPv4 Address.*?:\s*([\d.]+)", line)
+        if ipv4:
+            pending_ip = ipv4.group(1).strip()
+            continue
+        mask = re.search(r"Subnet Mask.*?:\s*([\d.]+)", line)
+        if mask and pending_ip:
+            prefix = _netmask_to_prefix(mask.group(1).strip())
+            if prefix is not None:
+                out.append((pending_ip, prefix))
+            pending_ip = None
+    return out
+
+
+def list_local_interfaces() -> list[tuple[str, int]]:
+    """Enumerate active NICs as ``(ipv4, prefix_length)`` from the OS.
+
+    Subnets are read from the machine's real interface configuration rather than
+    assumed, so discovery scans exactly the networks this host is attached to.
+    Loopback, link-local and unspecified addresses are skipped. Returns an empty
+    list if no network tool could be queried (callers then fall back).
+    """
+    if platform.system() == "Windows":
+        commands: list[tuple[list[str], object]] = [
+            (["ipconfig"], _parse_windows_ipconfig_output),
+        ]
+    else:
+        commands = [
+            (["ip", "-o", "-f", "inet", "addr", "show"], _parse_ip_addr_output),
+            (["ifconfig", "-a"], _parse_ifconfig_output),
+            (["ifconfig"], _parse_ifconfig_output),
+        ]
+    for argv, parser in commands:
+        try:
+            proc = subprocess.run(argv, capture_output=True, text=True, timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if not proc.stdout:
+            continue
+        result: list[tuple[str, int]] = []
+        for ip, prefix in parser(proc.stdout):  # type: ignore[operator]
+            try:
+                addr = ipaddress.ip_address(ip)
+            except ValueError:
+                continue
+            if addr.is_loopback or addr.is_link_local or addr.is_unspecified:
+                continue
+            if not (0 <= prefix <= 32):
+                continue
+            result.append((ip, prefix))
+        if result:
+            return result
+    return []
+
+
+def subnets_from_ips(ips: list[str], prefix: int = 24) -> list[str]:
+    """Derive unique CIDR subnets (default /24) covering the given IPv4 addresses.
+
+    Fallback only, used when real NIC netmasks cannot be read from the OS.
+    """
+    nets: list[str] = []
+    seen: set[str] = set()
+    for ip in ips:
+        try:
+            net = ipaddress.ip_network(f"{ip}/{prefix}", strict=False)
+        except ValueError:
+            continue
+        key = str(net)
+        if key not in seen:
+            seen.add(key)
+            nets.append(key)
+    return nets
+
+
+def list_local_subnets(fallback_prefix: int = 24) -> list[str]:
+    """All local IPv4 subnets, taken from the active NIC(s) real netmasks.
+
+    Falls back to approximating each detected address as a /``fallback_prefix``
+    network only when the OS interface list cannot be obtained.
+    """
+    subnets: list[str] = []
+    seen: set[str] = set()
+    for ip, prefix in list_local_interfaces():
+        try:
+            net = ipaddress.ip_network(f"{ip}/{prefix}", strict=False)
+        except ValueError:
+            continue
+        key = str(net)
+        if key not in seen:
+            seen.add(key)
+            subnets.append(key)
+    if subnets:
+        return subnets
+    return subnets_from_ips(list_local_ipv4s(), fallback_prefix)
+
+
+def _hosts_for_subnets(subnets: list[str], cap: int = DISCOVERY_MAX_HOSTS) -> list[str]:
+    hosts: list[str] = []
+    for cidr in subnets:
+        try:
+            net = ipaddress.ip_network(cidr, strict=False)
+        except ValueError:
+            continue
+        for host in net.hosts():
+            hosts.append(str(host))
+            if len(hosts) >= cap:
+                return hosts
+    return hosts
+
+
+def probe_discovery(host: str, port: int = DEFAULT_PORT,
+                    timeout: float = DISCOVERY_TIMEOUT) -> dict | None:
+    """Return anonymous mesh discovery metadata for a reachable node."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(timeout)
+        try:
+            if sock.connect_ex((host, port)) != 0:
+                return None
+        except OSError:
+            return None
+    try:
+        hello = _get_json(f"{host}:{port}", "/mesh/discover", timeout=timeout)
+    except Exception:
+        return None
+    if not isinstance(hello, dict) or not hello.get("ok") or not hello.get("mesh_id"):
+        return None
+    hello["advertise"] = f"{host}:{port}"
+    return hello
+
+
+def probe_node(host: str, port: int = DEFAULT_PORT, timeout: float = DISCOVERY_TIMEOUT,
+               mesh_id: str | None = None) -> dict | None:
+    """Return a peer's hello payload only when it proves membership in ``mesh_id``."""
+    if not mesh_id:
+        return None
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(timeout)
+        try:
+            if sock.connect_ex((host, port)) != 0:
+                return None
+        except OSError:
+            return None
+    try:
+        hello = _get_json(f"{host}:{port}", _mesh_path("/mesh/hello", mesh_id), timeout=timeout)
+    except Exception:
+        return None
+    if not isinstance(hello, dict) or not hello.get("ok"):
+        return None
+    hello["mesh_id"] = mesh_id
+    hello["advertise"] = f"{host}:{port}"
+    return hello
+
+
+def _group_meshes(hellos: list[dict], current_mesh_id: str | None) -> list[dict]:
+    """Group ``/mesh/hello`` responses into per-mesh summaries."""
+    grouped: dict[str, dict] = {}
+    for hello in hellos:
+        mesh_id = hello.get("mesh_id")
+        if not mesh_id:
+            continue
+        name, _, suffix = str(mesh_id).rpartition("-")
+        if not name:  # no dash -> treat whole id as the name
+            name, suffix = str(mesh_id), ""
+        entry = grouped.setdefault(mesh_id, {
+            "mesh_id": mesh_id,
+            "name": name,
+            "suffix": suffix,
+            "nodes": [],
+            "is_current": bool(current_mesh_id) and mesh_id == current_mesh_id,
+        })
+        node = {"advertise": hello.get("advertise"), "node_id": hello.get("node_id")}
+        if node not in entry["nodes"]:
+            entry["nodes"].append(node)
+    result = []
+    for entry in grouped.values():
+        entry["node_count"] = len(entry["nodes"])
+        result.append(entry)
+    result.sort(key=lambda e: (not e["is_current"], e["name"], e["suffix"]))
+    return result
+
+
+def discover_meshes(port: int = DEFAULT_PORT, timeout: float = DISCOVERY_TIMEOUT,
+                    subnets: list[str] | None = None,
+                    max_workers: int = DISCOVERY_MAX_WORKERS) -> dict:
+    """Scan local subnets on all enabled NICs for reachable mesh nodes.
+
+    Groups the responses by mesh id and marks the mesh this node currently
+    belongs to. The result is cached for the live-status endpoint so the header
+    indicator can list adjacent meshes without re-scanning every poll.
+    """
+    cfg = load_config() or {}
+    current = cfg.get("mesh_id") if cfg.get("enabled") else None
+    subnets = subnets if subnets is not None else list_local_subnets()
+    hosts = _hosts_for_subnets(subnets)
+    hellos: list[dict] = []
+    if hosts:
+        with ThreadPoolExecutor(max_workers=min(max_workers, len(hosts))) as pool:
+            for hello in pool.map(lambda h: probe_discovery(h, port, timeout), hosts):
+                if hello:
+                    hellos.append(hello)
+    meshes = _group_meshes(hellos, current)
+    result = {
+        "subnets": subnets,
+        "scanned_hosts": len(hosts),
+        "meshes": meshes,
+        "current_mesh_id": current,
+        "scanned_at": datetime.now(timezone.utc).isoformat(),
+    }
+    with _RUNTIME_LOCK:
+        _RUNTIME["last_scan"] = result
+    return result
+
+
+def _update_liveness_and_propagation(cfg: dict, registry: _PeerRegistry) -> None:
+    """Probe configured peers for liveness and update propagation timings.
+
+    A peer counts as *active* when it responds to ``/mesh/hello`` with our mesh
+    id. For every locally-originated event, the time until it is present on all
+    active peers is recorded (rolling window) as the propagation latency.
+    """
+    node_id = cfg.get("node_id")
+    mesh_id = cfg.get("mesh_id")
+    now = time.time()
+    active: dict[str, dict] = {}
+    peer_has: dict[str, set[str]] = {}
+    for peer in registry.all():
+        try:
+            hello = _get_json(peer, _mesh_path("/mesh/hello", mesh_id), timeout=2.0)
+        except Exception:
+            continue
+        if not hello.get("ok"):
+            continue
+        active[peer] = {"last_seen": now, "node_id": hello.get("node_id")}
+        try:
+            ids = _get_json(
+                peer, _mesh_path("/mesh/event-ids", mesh_id, origin=node_id), timeout=3.0
+            ).get("ids", [])
+            peer_has[peer] = set(ids)
+        except Exception:
+            peer_has[peer] = set()
+    with _RUNTIME_LOCK:
+        _RUNTIME["active_peers"] = active
+    if not active:
+        return  # nothing to propagate to; propagation time is undefined
+    try:
+        with _db() as conn:
+            rows = conn.execute(
+                "SELECT event_id, created_at FROM oplog WHERE origin_node = ? "
+                "ORDER BY lamport DESC LIMIT ?",
+                (node_id, PROPAGATION_WINDOW * 4),
+            ).fetchall()
+    except sqlite3.Error:
+        return
+    _record_propagations(rows, peer_has, now)
+
+
+def _record_propagations(rows, peer_has: dict[str, set[str]], now: float) -> int:
+    """Record propagation latency for events now present on every active peer.
+
+    ``rows`` is an iterable of ``(event_id, created_at_iso)``. Returns the number
+    of newly-recorded propagation samples. Pure enough to unit-test directly.
+    """
+    if not peer_has:
+        return 0
+    recorded = 0
+    with _RUNTIME_LOCK:
+        already = _RUNTIME["prop_recorded"]
+        window = _RUNTIME["prop_seconds"]
+        for event_id, created_at in rows:
+            if event_id in already:
+                continue
+            if not all(event_id in have for have in peer_has.values()):
+                continue
+            try:
+                created = datetime.fromisoformat(str(created_at))
+                if created.tzinfo is None:
+                    created = created.replace(tzinfo=timezone.utc)
+            except ValueError:
+                continue
+            seconds = max(0.0, now - created.timestamp())
+            window.append(seconds)
+            already.add(event_id)
+            recorded += 1
+    return recorded
+
+
+def mesh_uptime_seconds() -> float | None:
+    with _RUNTIME_LOCK:
+        started = _RUNTIME.get("started_at")
+    if not started:
+        return None
+    return max(0.0, time.time() - started)
+
+
+def active_peers() -> list[dict]:
+    now = time.time()
+    with _RUNTIME_LOCK:
+        peers = dict(_RUNTIME.get("active_peers") or {})
+    out = []
+    for advertise, info in peers.items():
+        if now - info.get("last_seen", 0) <= PEER_ACTIVE_TTL:
+            out.append({"advertise": advertise, "node_id": info.get("node_id")})
+    out.sort(key=lambda p: p["advertise"] or "")
+    return out
+
+
+def mean_propagation_seconds() -> float | None:
+    with _RUNTIME_LOCK:
+        window = list(_RUNTIME.get("prop_seconds") or [])
+    if not window:
+        return None
+    return round(sum(window) / len(window), 3)
+
+
+def runtime_status() -> dict:
+    """Aggregate live mesh status for the dashboard header/indicator and modal."""
+    cfg = load_config() or {}
+    enabled = bool(cfg.get("enabled") and cfg.get("mesh_id") and cfg.get("node_id"))
+    peers = active_peers()
+    with _RUNTIME_LOCK:
+        syncing = bool(_RUNTIME.get("syncing"))
+        last_sync_ok = _RUNTIME.get("last_sync_ok")
+        last_sync_at = _RUNTIME.get("last_sync_at")
+        running = _RUNTIME.get("server") is not None
+        last_scan = _RUNTIME.get("last_scan")
+    adjacent = []
+    if last_scan:
+        adjacent = [m for m in last_scan.get("meshes", [])
+                    if not m.get("is_current") and m.get("node_count", 0) >= 1]
+    return {
+        "available": True,
+        "enabled": enabled,
+        "running": running,
+        "mesh_id": cfg.get("mesh_id") if enabled else None,
+        "node_id": cfg.get("node_id") if enabled else None,
+        "mesh_name": (cfg.get("mesh_id") or "").rpartition("-")[0] if enabled else None,
+        "connected": enabled and len(peers) >= 1,
+        "peer_count": len(peers),
+        "active_peers": peers,
+        "syncing": syncing,
+        "last_sync_ok": last_sync_ok,
+        "last_sync_at": last_sync_at,
+        "uptime_seconds": mesh_uptime_seconds() if enabled else None,
+        "mean_propagation_seconds": mean_propagation_seconds() if enabled else None,
+        "adjacent_meshes": adjacent,
+        "listen_port": int(cfg.get("listen_port", DEFAULT_PORT)),
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Runtime create / join / leave (invoked from the dashboard control API)
+# --------------------------------------------------------------------------- #
+def leave_mesh() -> dict:
+    """Leave the current mesh: stop replicating and clear the mesh identity.
+
+    History (oplog + base tables) is preserved. The stable ``node_id`` is kept so
+    re-joining later reuses the same identity. Only one mesh can be joined at a
+    time, so leaving fully clears ``mesh_id`` and configured peers.
+    """
+    stop_mesh()
+    cfg = load_config() or {}
+    left = cfg.get("mesh_id")
+    cfg["enabled"] = False
+    cfg["mesh_id"] = None
+    cfg["peers"] = []
+    save_config(cfg)
+    with _RUNTIME_LOCK:
+        _RUNTIME["prop_seconds"] = deque(maxlen=PROPAGATION_WINDOW)
+        _RUNTIME["prop_recorded"] = set()
+        _RUNTIME["active_peers"] = {}
+    log(f"left mesh {left}")
+    return {"left": left}
+
+
+def _current_app_version() -> str:
+    with _RUNTIME_LOCK:
+        return _RUNTIME.get("app_version") or ""
+
+
+def create_mesh_runtime(name: str | None = None, port: int = DEFAULT_PORT,
+                        advertise: str | None = None,
+                        peers: list[str] | None = None, restart: bool = True) -> dict:
+    """Create a new mesh on this node and (optionally) bring it up immediately."""
+    cfg, emitted = enable_new_mesh(name, port, advertise, peers or [])
+    started = start_mesh(_current_app_version()) if restart else False
+    return {"mesh_id": cfg["mesh_id"], "node_id": cfg["node_id"],
+            "backfilled": emitted, "started": started}
+
+
+def join_mesh_runtime(mesh_id: str, port: int = DEFAULT_PORT, advertise: str | None = None,
+                      peers: list[str] | None = None, restart: bool = True) -> dict:
+    """Join an existing mesh by id and (optionally) bring it up immediately.
+
+    Leaving any current mesh first enforces the single-mesh invariant.
+    """
+    if load_config() and (load_config() or {}).get("mesh_id"):
+        leave_mesh()
+    cfg, emitted = join_mesh(mesh_id, port, advertise, peers or [])
+    started = start_mesh(_current_app_version()) if restart else False
+    return {"mesh_id": cfg["mesh_id"], "node_id": cfg["node_id"],
+            "backfilled": emitted, "started": started}
 
 
 # --------------------------------------------------------------------------- #
@@ -1221,8 +1830,8 @@ def cmd_status(args) -> int:
     print(f"peers:     {len(peers)}")
     for peer in peers:
         try:
-            hello = _get_json(peer, "/mesh/hello", timeout=3.0)
-            ok = "reachable" if hello.get("mesh_id") == cfg.get("mesh_id") else "MESH MISMATCH"
+            hello = _get_json(peer, _mesh_path("/mesh/hello", cfg.get("mesh_id")), timeout=3.0)
+            ok = "reachable" if hello.get("ok") else "MESH MISMATCH"
             print(f"             {peer}: {ok}")
         except Exception as exc:
             print(f"             {peer}: unreachable ({exc})")
@@ -1269,6 +1878,31 @@ def cmd_disable(args) -> int:
     return 0
 
 
+def cmd_leave(args) -> int:
+    cfg = load_config()
+    if not (cfg and cfg.get("mesh_id")):
+        print("Not a member of any mesh.")
+        return 0
+    result = leave_mesh()
+    print(f"Left mesh {result['left']}. History is preserved; join another with 'join'.")
+    return 0
+
+
+def cmd_discover(args) -> int:
+    result = discover_meshes(port=args.port)
+    print(f"Scanned {result['scanned_hosts']} host(s) across {len(result['subnets'])} subnet(s): "
+          f"{', '.join(result['subnets']) or '(none)'}")
+    if not result["meshes"]:
+        print("No mesh networks found.")
+        return 0
+    for m in result["meshes"]:
+        marker = " (current)" if m["is_current"] else ""
+        print(f"  {m['name']}-{m['suffix']}{marker}: {m['node_count']} node(s)")
+        for node in m["nodes"]:
+            print(f"      {node['advertise']}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="drachometer_mesh.py",
@@ -1306,6 +1940,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_migrate.set_defaults(func=cmd_migrate)
 
     sub.add_parser("disable", help="Disable mesh replication (history preserved)." ).set_defaults(func=cmd_disable)
+
+    sub.add_parser("leave", help="Leave the current mesh (history preserved)." ).set_defaults(func=cmd_leave)
+
+    p_discover = sub.add_parser("discover", help="Scan local subnets for reachable mesh networks.")
+    p_discover.add_argument("--port", type=int, default=DEFAULT_PORT)
+    p_discover.set_defaults(func=cmd_discover)
     return parser
 
 
