@@ -8,6 +8,7 @@ Run with:  python -m unittest discover -s tests
 import json
 import os
 import sqlite3
+import ipaddress
 import socket
 import subprocess
 import sys
@@ -188,9 +189,10 @@ class MeshTestBase(unittest.TestCase):
         deadline = time.monotonic() + 15
         while time.monotonic() < deadline:
             try:
-                with urllib.request.urlopen(f"http://127.0.0.1:{port}/mesh/hello", timeout=0.5) as resp:
+                hello_url = f"http://127.0.0.1:{port}{mesh._mesh_path('/mesh/hello', mesh_id)}"
+                with urllib.request.urlopen(hello_url, timeout=0.5) as resp:
                     payload = json.loads(resp.read().decode("utf-8"))
-                    if payload.get("node_id") == node_id:
+                    if payload.get("ok") and payload.get("node_id") == node_id:
                         return proc
             except Exception:
                 time.sleep(0.1)
@@ -642,6 +644,252 @@ class TestTwoNodeConvergence(MeshTestBase):
         applied = mesh.sync_with_peer(cfg_a, f"127.0.0.1:{port_b}")
         self.assertEqual(applied, 0)
         self.assertEqual(turn_sessions(db_a), {"a1"})  # nothing leaked across meshes
+
+
+class TestSubnetDiscovery(MeshTestBase):
+    def test_subnets_from_ips_deduplicates_and_masks(self):
+        subnets = mesh.subnets_from_ips(
+            ["192.168.1.50", "192.168.1.99", "10.0.0.4", "127.0.0.1"]
+        )
+        self.assertIn("192.168.1.0/24", subnets)
+        self.assertIn("10.0.0.0/24", subnets)
+        # 192.168.1.50 and .99 collapse to one /24
+        self.assertEqual(len([s for s in subnets if s.startswith("192.168.1.")]), 1)
+
+    def test_hosts_for_subnets_respects_cap(self):
+        hosts = mesh._hosts_for_subnets(["10.0.0.0/24"], cap=5)
+        self.assertEqual(len(hosts), 5)
+        self.assertEqual(hosts[0], "10.0.0.1")
+
+    def test_netmask_to_prefix_accepts_hex_dotted_and_bare(self):
+        self.assertEqual(mesh._netmask_to_prefix("0xffffff00"), 24)
+        self.assertEqual(mesh._netmask_to_prefix("255.255.254.0"), 23)
+        self.assertEqual(mesh._netmask_to_prefix("16"), 16)
+        self.assertIsNone(mesh._netmask_to_prefix("not-a-mask"))
+
+    def test_parse_ip_addr_output_uses_real_prefix(self):
+        text = (
+            "1: lo    inet 127.0.0.1/8 scope host lo\n"
+            "2: eth0    inet 192.168.1.50/23 brd 192.168.1.255 scope global eth0\n"
+        )
+        self.assertEqual(mesh._parse_ip_addr_output(text),
+                         [("127.0.0.1", 8), ("192.168.1.50", 23)])
+
+    def test_parse_ifconfig_output_hex_and_dotted_masks(self):
+        hexed = mesh._parse_ifconfig_output(
+            "inet 10.0.0.5 netmask 0xffffff00 broadcast 10.0.0.255")
+        self.assertEqual(hexed, [("10.0.0.5", 24)])
+        dotted = mesh._parse_ifconfig_output(
+            "inet 172.16.0.9  netmask 255.255.254.0  broadcast 172.16.1.255")
+        self.assertEqual(dotted, [("172.16.0.9", 23)])
+
+    def test_parse_windows_ipconfig_pairs_ip_and_mask(self):
+        text = (
+            "   IPv4 Address. . . . . . . . . . . : 192.168.0.20\n"
+            "   Subnet Mask . . . . . . . . . . . : 255.255.255.0\n"
+        )
+        self.assertEqual(mesh._parse_windows_ipconfig_output(text),
+                         [("192.168.0.20", 24)])
+
+    def test_list_local_subnets_derives_from_active_nics(self):
+        # Real NIC enumeration: subnets come from the interface netmask, not a
+        # hard-coded /24. Assert each returned subnet is the network address of
+        # a detected interface at its real prefix length.
+        ifaces = mesh.list_local_interfaces()
+        subnets = mesh.list_local_subnets()
+        self.assertIsInstance(subnets, list)
+        for ip, prefix in ifaces:
+            expected = str(ipaddress.ip_network(f"{ip}/{prefix}", strict=False))
+            self.assertIn(expected, subnets)
+
+    def test_list_local_subnets_falls_back_when_no_interfaces(self):
+        orig = mesh.list_local_interfaces
+        mesh.list_local_interfaces = lambda: []
+        try:
+            subnets = mesh.list_local_subnets(fallback_prefix=24)
+        finally:
+            mesh.list_local_interfaces = orig
+        for cidr in subnets:
+            self.assertTrue(cidr.endswith("/24"))
+
+    def test_group_meshes_marks_current_and_counts_nodes(self):
+        hellos = [
+            {"mesh_id": "home-aaaa1111", "node_id": "n1", "advertise": "192.168.1.10:9874"},
+            {"mesh_id": "home-aaaa1111", "node_id": "n2", "advertise": "192.168.1.11:9874"},
+            {"mesh_id": "lab-bbbb2222", "node_id": "n3", "advertise": "192.168.1.12:9874"},
+        ]
+        grouped = mesh._group_meshes(hellos, current_mesh_id="home-aaaa1111")
+        by_id = {m["mesh_id"]: m for m in grouped}
+        self.assertTrue(by_id["home-aaaa1111"]["is_current"])
+        self.assertEqual(by_id["home-aaaa1111"]["node_count"], 2)
+        self.assertEqual(by_id["home-aaaa1111"]["name"], "home")
+        self.assertEqual(by_id["home-aaaa1111"]["suffix"], "aaaa1111")
+        self.assertFalse(by_id["lab-bbbb2222"]["is_current"])
+        self.assertEqual(by_id["lab-bbbb2222"]["node_count"], 1)
+
+    def test_probe_node_and_discover_find_live_mesh(self):
+        db_a = self.tmp / "a.db"
+        seed_db(db_a, "nodeA", ["a1"])
+        port, listen_socket = self._reserve_port()
+        self._spawn_mesh_node(db_a, "nodeA", "home-cccc3333", port, listen_socket=listen_socket)
+
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/mesh/hello", timeout=0.5) as resp:
+            anonymous = json.loads(resp.read().decode("utf-8"))
+        self.assertFalse(anonymous["ok"])
+        self.assertFalse(anonymous["mesh_id_match"])
+        self.assertNotIn("mesh_id", anonymous)
+
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/mesh/discover", timeout=0.5) as resp:
+            discovered = json.loads(resp.read().decode("utf-8"))
+        self.assertTrue(discovered["ok"])
+        self.assertEqual(discovered["mesh_id"], "home-cccc3333")
+
+        hello = mesh.probe_node("127.0.0.1", port, mesh_id="home-cccc3333")
+        self.assertIsNotNone(hello)
+        self.assertEqual(hello["mesh_id"], "home-cccc3333")
+        self.assertEqual(hello["advertise"], f"127.0.0.1:{port}")
+
+        mesh.save_config(mesh.normalize_config({
+            "enabled": True,
+            "mesh_id": "home-cccc3333",
+            "node_id": "local-node",
+        }))
+
+        # A /30 over loopback includes 127.0.0.1 as a scannable host.
+        result = mesh.discover_meshes(port=port, subnets=["127.0.0.0/30"])
+        ids = {m["mesh_id"] for m in result["meshes"]}
+        self.assertIn("home-cccc3333", ids)
+
+    def test_discover_meshes_finds_other_mesh_than_current(self):
+        db_a = self.tmp / "a.db"
+        seed_db(db_a, "nodeA", ["a1"])
+        port, listen_socket = self._reserve_port()
+        self._spawn_mesh_node(db_a, "nodeA", "lab-dddd4444", port, listen_socket=listen_socket)
+
+        mesh.CONFIG_PATH = self.tmp / "mesh.json"
+        mesh.save_config(mesh.normalize_config({
+            "enabled": True,
+            "mesh_id": "home-cccc3333",
+            "node_id": "local-node",
+        }))
+
+        result = mesh.discover_meshes(port=port, subnets=["127.0.0.0/30"])
+        by_id = {m["mesh_id"]: m for m in result["meshes"]}
+        self.assertEqual(result["current_mesh_id"], "home-cccc3333")
+        self.assertIn("lab-dddd4444", by_id)
+        self.assertFalse(by_id["lab-dddd4444"]["is_current"])
+
+    def test_discover_meshes_works_without_current_mesh(self):
+        db_a = self.tmp / "a.db"
+        seed_db(db_a, "nodeA", ["a1"])
+        port, listen_socket = self._reserve_port()
+        self._spawn_mesh_node(db_a, "nodeA", "lab-dddd4444", port, listen_socket=listen_socket)
+
+        mesh.CONFIG_PATH = self.tmp / "mesh.json"
+        if mesh.CONFIG_PATH.exists():
+            mesh.CONFIG_PATH.unlink()
+        result = mesh.discover_meshes(port=port, subnets=["127.0.0.0/30"])
+        self.assertIsNone(result["current_mesh_id"])
+        self.assertEqual({m["mesh_id"] for m in result["meshes"]}, {"lab-dddd4444"})
+
+    def test_probe_node_rejects_non_mesh_port(self):
+        port, _ = self._reserve_port()  # bound but not a mesh server
+        self.assertIsNone(mesh.probe_node("127.0.0.1", port, timeout=0.3))
+
+
+class TestPropagationTracking(MeshTestBase):
+    def setUp(self):
+        super().setUp()
+        mesh._RUNTIME["prop_seconds"] = mesh.deque(maxlen=mesh.PROPAGATION_WINDOW)
+        mesh._RUNTIME["prop_recorded"] = set()
+
+    def test_records_only_events_present_on_all_active_peers(self):
+        now = mesh.time.time()
+        rows = [
+            ("e1", "2026-06-26T10:00:00+00:00"),
+            ("e2", "2026-06-26T10:00:00+00:00"),
+        ]
+        peer_has = {"p1": {"e1", "e2"}, "p2": {"e1"}}  # e2 missing on p2
+        recorded = mesh._record_propagations(rows, peer_has, now)
+        self.assertEqual(recorded, 1)  # only e1 fully propagated
+        self.assertIsNotNone(mesh.mean_propagation_seconds())
+
+    def test_events_are_not_double_counted(self):
+        now = mesh.time.time()
+        rows = [("e1", "2026-06-26T10:00:00+00:00")]
+        peer_has = {"p1": {"e1"}}
+        self.assertEqual(mesh._record_propagations(rows, peer_has, now), 1)
+        self.assertEqual(mesh._record_propagations(rows, peer_has, now), 0)
+
+    def test_rolling_window_keeps_last_15(self):
+        now = mesh.time.time()
+        rows = [(f"e{i}", "2026-06-26T10:00:00+00:00") for i in range(20)]
+        peer_has = {"p1": {f"e{i}" for i in range(20)}}
+        mesh._record_propagations(rows, peer_has, now)
+        self.assertEqual(len(mesh._RUNTIME["prop_seconds"]), mesh.PROPAGATION_WINDOW)
+
+    def test_no_active_peers_records_nothing(self):
+        self.assertEqual(
+            mesh._record_propagations([("e1", "2026-06-26T10:00:00+00:00")], {}, mesh.time.time()),
+            0,
+        )
+        self.assertIsNone(mesh.mean_propagation_seconds())
+
+
+class TestRuntimeControl(MeshTestBase):
+    def setUp(self):
+        super().setUp()
+        # A base schema so backfill during create/join has a turns table.
+        conn = sqlite3.connect(mesh.DB_PATH)
+        conn.executescript(BASE_SCHEMA)
+        conn.commit()
+        conn.close()
+        self.addCleanup(mesh.stop_mesh)
+
+    def test_create_runtime_writes_config_and_status(self):
+        result = mesh.create_mesh_runtime(name="home", restart=False)
+        self.assertTrue(result["mesh_id"].startswith("home-"))
+        status = mesh.runtime_status()
+        self.assertTrue(status["enabled"])
+        self.assertEqual(status["mesh_name"], "home")
+        self.assertEqual(status["peer_count"], 0)
+        self.assertFalse(status["connected"])  # no peers yet
+
+    def test_join_enforces_single_mesh_by_leaving_current(self):
+        mesh.create_mesh_runtime(name="home", restart=False)
+        mesh.join_mesh_runtime("lab-bbbb2222", peers=["192.168.1.9:9874"], restart=False)
+        cfg = mesh.load_config()
+        self.assertEqual(cfg["mesh_id"], "lab-bbbb2222")
+        self.assertEqual(cfg["peers"], ["192.168.1.9:9874"])
+
+    def test_leave_clears_membership_but_keeps_node_id(self):
+        created = mesh.create_mesh_runtime(name="home", restart=False)
+        node_id = created["node_id"]
+        result = mesh.leave_mesh()
+        self.assertTrue(result["left"].startswith("home-"))
+        cfg = mesh.load_config()
+        self.assertFalse(cfg["enabled"])
+        self.assertIsNone(cfg["mesh_id"])
+        self.assertEqual(cfg["peers"], [])
+        self.assertEqual(cfg["node_id"], node_id)  # identity preserved
+        self.assertFalse(mesh.runtime_status()["enabled"])
+
+    def test_runtime_status_shape_when_disabled(self):
+        status = mesh.runtime_status()
+        for key in ("available", "enabled", "connected", "peer_count",
+                    "syncing", "uptime_seconds", "mean_propagation_seconds",
+                    "adjacent_meshes", "active_peers"):
+            self.assertIn(key, status)
+        self.assertTrue(status["available"])
+        self.assertFalse(status["enabled"])
+
+    def test_start_and_stop_mesh_tracks_uptime(self):
+        mesh.create_mesh_runtime(name="home", restart=False)
+        self.assertTrue(mesh.start_mesh(app_version="test"))
+        self.assertIsNotNone(mesh.mesh_uptime_seconds())
+        self.assertTrue(mesh.runtime_status()["running"])
+        self.assertTrue(mesh.stop_mesh())
+        self.assertIsNone(mesh.mesh_uptime_seconds())
 
 
 if __name__ == "__main__":

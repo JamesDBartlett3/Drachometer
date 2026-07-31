@@ -305,9 +305,11 @@ When configured, the hook deletes `turns` and `tool_calls` rows older than the r
 
 ## Mesh Replication (LAN/VM)
 
-> **Status:** Phase 1 (MVP). Opt-in and off by default — single-node users are unaffected.
+> **Status:** Configured from the dashboard. Off by default — single-node users are unaffected.
 
 Mesh replication lets several machines on the same trusted network share one combined view of your Claude Code usage. Each node keeps its own local database and they converge toward the union of everyone's history.
+
+Mesh is now set up **from the dashboard**, not during installation. Open the dashboard and use the **hamburger menu (☰) to the left of the logo → “Configure Local Mesh Network.”**
 
 ### Scope and safety
 
@@ -320,24 +322,36 @@ Mesh replication lets several machines on the same trusted network share one com
 - Nodes gossip over plain HTTP using **pull-based anti-entropy**: a node compares per-origin event counts with each peer and fetches only the events it is missing. No broker and no third-party dependencies.
 - Because each Claude Code session runs on a single machine, `session_id` partitions writes by node, so merging is a conflict-free **union**. The rare case of the same turn re-logged is resolved last-writer-wins by timestamp.
 
-### Enabling it
+### Enabling it (from the dashboard)
 
-Create a new mesh on the first node (during install or any time afterward):
+Open the dashboard, click the **hamburger menu (☰)** to the left of the logo, and choose **“Configure Local Mesh Network.”** The configuration window:
+
+- **Scans all local subnets on every enabled NIC** for existing mesh networks and lists any it finds, along with adjacent meshes that have at least one active node.
+- **Join an existing mesh:** pick a discovered mesh and enter the segment of its name that comes **after the final dash** (e.g. for `home-a1b2c3d4`, enter `a1b2c3d4`). This shared secret keeps unrelated meshes on the same LAN from accidentally merging.
+- **Create a new mesh:** give it a name and a new mesh id like `home-a1b2c3d4` is generated.
+- **Leave:** stop replicating. History is preserved and your node identity is kept for re-joining later.
+
+Only **one mesh can be joined at a time** — joining or creating a mesh automatically leaves the current one, even if it has no active peers.
+
+### Header status indicator
+
+When you belong to a mesh, a small indicator appears just to the right of **Drachometer** in the header:
+
+- a **gray/green dot** — green when at least one peer is connected, gray otherwise;
+- a **sync icon** that animates while a sync round is in progress, plus the usual success/failure icons;
+- **`{n} peer(s) connected`.**
+
+Clicking any part of the indicator opens the same configuration window, which also shows mesh details: active peers on the current network, adjacent meshes with at least one active node, current-mesh uptime, and the mean time between a new record and its complete propagation to all active nodes (rolling window of the last 15 records).
+
+### Command line (optional)
+
+The same operations are available from the installed mesh script if you prefer a terminal:
 
 ```powershell
-# during install
-python drachometer-install.py --enable-mesh --mesh-name home
-
-# or later, from the installed location
-python "$HOME/.claude/hooks/drachometer/drachometer_mesh.py" init --name home
-```
-
-This prints a **mesh id** like `home-a1b2c3d4`. Join it from another node:
-
-```powershell
-python drachometer-install.py --join-mesh home-a1b2c3d4 --peer 192.168.1.10:9874
-# or later:
+python "$HOME/.claude/hooks/drachometer/drachometer_mesh.py" discover        # scan LAN for meshes
+python "$HOME/.claude/hooks/drachometer/drachometer_mesh.py" init --name home # create a mesh
 python "$HOME/.claude/hooks/drachometer/drachometer_mesh.py" join home-a1b2c3d4 --peer 192.168.1.10:9874
+python "$HOME/.claude/hooks/drachometer/drachometer_mesh.py" leave           # leave the current mesh
 ```
 
 Options: `--mesh-port` (default `9874`), `--advertise HOST` (the address peers use to reach this node; auto-detected if omitted), and repeatable `--peer HOST:PORT` seeds. The mesh server starts automatically with the dashboard server.

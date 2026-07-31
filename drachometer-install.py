@@ -12,11 +12,16 @@ Usage:
 
 import argparse
 import json
+import os
 import re
 import shutil
+import signal
+import socket
 import sqlite3
 import subprocess
 import sys
+import time
+import urllib.request
 from pathlib import Path
 
 CLAUDE_DIR = Path.home() / ".claude"
@@ -27,6 +32,8 @@ SETTINGS_PATH = CLAUDE_DIR / "settings.json"
 DB_PATH = CLAUDE_DIR / "drachometer.db"
 VERSION_PATH = HOOKS_DIR / "drachometer-version.json"
 LEGACY_VERSION_PATH = HOOKS_ROOT_DIR / "drachometer-version.json"
+DASHBOARD_PORT = 9873
+PID_PATH = CLAUDE_DIR / "drachometer-dashboard.pid"
 
 REPO_HOOKS = Path(__file__).resolve().parent / "hooks"
 REPO_DASHBOARD = Path(__file__).resolve().parent / "drachometer-dashboard.html"
@@ -103,6 +110,134 @@ def detect_installed_version() -> str:
             except (OSError, json.JSONDecodeError, ValueError):
                 pass
     return "0.0.0"
+
+
+# --------------------------------------------------------------------------- #
+# Running-instance detection
+#
+# A previously-installed dashboard server may still be running from an older
+# version. Overwriting the hook files while it runs serves stale code and, on
+# Windows, can fail because the files are locked. Detect it and stop it (or ask
+# the user to) before copying anything.
+# --------------------------------------------------------------------------- #
+def is_port_open(host: str, port: int, timeout: float = 0.5) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(timeout)
+        try:
+            return sock.connect_ex((host, port)) == 0
+        except OSError:
+            return False
+
+
+def query_running_health(timeout: float = 1.5) -> dict | None:
+    """Ask a running server for its /health payload (version + pid)."""
+    try:
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{DASHBOARD_PORT}/health", timeout=timeout
+        ) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return None
+
+
+def read_pid_file() -> dict | None:
+    try:
+        return json.loads(PID_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+
+
+def request_server_shutdown(timeout: float = 3.0) -> bool:
+    """Ask a running server to shut down gracefully via its /shutdown endpoint."""
+    try:
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{DASHBOARD_PORT}/shutdown", data=b"{}",
+            headers={"Content-Type": "application/json"}, method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=timeout):
+            return True
+    except Exception:
+        return False
+
+
+def terminate_pid(pid: int) -> bool:
+    """Terminate a process by PID, cross-platform. Returns True if a stop was attempted."""
+    if not pid:
+        return False
+    try:
+        if os.name == "nt":
+            result = subprocess.run(
+                ["taskkill", "/F", "/PID", str(pid)],
+                capture_output=True, text=True,
+            )
+            return result.returncode == 0
+        os.kill(pid, signal.SIGTERM)
+        return True
+    except (ProcessLookupError, PermissionError, OSError):
+        return False
+
+
+def wait_port_closed(host: str, port: int, timeout: float) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not is_port_open(host, port, 0.3):
+            return True
+        time.sleep(0.3)
+    return not is_port_open(host, port, 0.3)
+
+
+def stop_running_instance(force: bool) -> bool:
+    """Detect and stop a running dashboard server before overwriting files.
+
+    Returns True if it is safe to continue installing (nothing running, or the
+    running instance was stopped). Returns False if a running instance could not
+    be stopped and the user did not authorize continuing anyway.
+    """
+    if not is_port_open("127.0.0.1", DASHBOARD_PORT):
+        return True
+
+    health = query_running_health()
+    pid_info = read_pid_file()
+    version = (health or {}).get("version") or (pid_info or {}).get("version") or "unknown"
+    pid = (health or {}).get("pid") or (pid_info or {}).get("pid")
+    print(f"  Detected a running Drachometer instance (version {version}"
+          f"{f', pid {pid}' if pid else ''}) on port {DASHBOARD_PORT}.")
+
+    # 1) Graceful shutdown (supported by current and newer servers).
+    if request_server_shutdown():
+        if wait_port_closed("127.0.0.1", DASHBOARD_PORT, 6.0):
+            print("  Stopped the running instance gracefully.")
+            return True
+
+    # 2) Terminate by PID (works for older servers that write a pid file).
+    if pid and terminate_pid(int(pid)):
+        if wait_port_closed("127.0.0.1", DASHBOARD_PORT, 6.0):
+            print(f"  Stopped the running instance (pid {pid}).")
+            return True
+
+    # 3) Could not stop it automatically.
+    if force:
+        print("  WARNING: could not stop the running instance; continuing anyway "
+              "(--force). Files in use may fail to update.")
+        return True
+
+    print("  ERROR: a previous Drachometer instance is still running and could not "
+          "be stopped automatically.")
+    print("  Close it (stop the process listening on port "
+          f"{DASHBOARD_PORT}) and re-run the installer, or pass --force to override.")
+    if sys.stdin.isatty():
+        answer = input("  Continue anyway? [y/N]: ").strip().lower()
+        if answer in ("y", "yes"):
+            return True
+    return False
+
+
+def check_running_instance(args) -> None:
+    """Abort the install if a prior version is running and cannot be stopped."""
+    if getattr(args, "skip_running_check", False):
+        return
+    if not stop_running_instance(force=getattr(args, "force", False)):
+        sys.exit(1)
 
 
 def migrate_settings_for_server_changes() -> bool:
@@ -518,11 +653,17 @@ def _import_mesh():
 
 
 def configure_mesh(args) -> None:
-    """Set up mesh replication when requested (flags or interactive opt-in).
+    """Optionally set up mesh replication from explicit CLI flags only.
 
-    Mesh is strictly opt-in: with no flags and no interactive 'yes', this is a
-    no-op and single-node users are unaffected.
+    Mesh is now configured from the dashboard (hamburger menu -> "Configure Local
+    Mesh Network"), so the installer no longer prompts interactively. Explicit
+    flags (``--enable-mesh`` / ``--join-mesh``) remain supported for automation.
+    With no mesh flags this is a no-op and single-node users are unaffected.
     """
+    if not (args.enable_mesh or args.join_mesh):
+        print("  Mesh is configured from the dashboard: open the hamburger menu (top-left)")
+        print("  and choose \"Configure Local Mesh Network\" to scan, create, or join a mesh.")
+        return
     try:
         mesh = _import_mesh()
     except Exception as exc:
@@ -537,23 +678,14 @@ def configure_mesh(args) -> None:
               f"backfilled {emitted} local event(s).")
         return
 
-    want_new = args.enable_mesh
-    name = args.mesh_name
-    if not want_new and not mesh.is_enabled() and not args.no_mesh and sys.stdin.isatty():
-        answer = input("\nEnable mesh replication across LAN/VM nodes? [y/N]: ").strip().lower()
-        want_new = answer in ("y", "yes")
-        if want_new and not name:
-            name = input("  Mesh name (e.g. 'home'): ").strip() or "mesh"
-
-    if want_new:
-        cfg, emitted = mesh.enable_new_mesh(name, args.mesh_port, args.advertise, peers)
-        print(f"  Mesh enabled: {cfg['mesh_id']} (node {cfg['node_id']})")
-        print(f"  Listening on {cfg['listen_host']}:{cfg['listen_port']}; "
-              f"advertising {cfg['advertise_host']}:{cfg['advertise_port']}; "
-              f"backfilled {emitted} event(s).")
-        print("  Add another node with:")
-        print(f"    python {HOOKS_DIR / 'drachometer_mesh.py'} join {cfg['mesh_id']} "
-              f"--peer {cfg['advertise_host']}:{cfg['advertise_port']}")
+    cfg, emitted = mesh.enable_new_mesh(args.mesh_name, args.mesh_port, args.advertise, peers)
+    print(f"  Mesh enabled: {cfg['mesh_id']} (node {cfg['node_id']})")
+    print(f"  Listening on {cfg['listen_host']}:{cfg['listen_port']}; "
+          f"advertising {cfg['advertise_host']}:{cfg['advertise_port']}; "
+          f"backfilled {emitted} event(s).")
+    print("  Other nodes can now join from their dashboard, or with:")
+    print(f"    python {HOOKS_DIR / 'drachometer_mesh.py'} join {cfg['mesh_id']} "
+          f"--peer {cfg['advertise_host']}:{cfg['advertise_port']}")
 
 
 def parse_args(argv=None) -> argparse.Namespace:
@@ -570,6 +702,10 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--advertise", help="Advertise host/IP peers use to reach this node.")
     parser.add_argument("--no-mesh", action="store_true",
                         help="Skip the interactive mesh opt-in prompt.")
+    parser.add_argument("--force", action="store_true",
+                        help="Continue installing even if a running instance cannot be stopped.")
+    parser.add_argument("--skip-running-check", action="store_true",
+                        help="Do not check for a running instance before installing.")
     return parser.parse_args(argv)
 
 
@@ -579,25 +715,28 @@ def main(argv=None) -> None:
     print("drachometer installer")
     print("=" * 40)
 
-    print("\n[1/7] Finding Python...")
+    print("\n[1/8] Checking for a running instance...")
+    check_running_instance(args)
+
+    print("\n[2/8] Finding Python...")
     python_exe = find_python()
     print(f"  Using: {python_exe}")
 
-    print("\n[2/7] Detecting installed version and running migrations...")
+    print("\n[3/8] Detecting installed version and running migrations...")
     installed_version = detect_installed_version()
     run_install_migrations(installed_version)
 
-    print("\n[3/7] Copying hook files...")
+    print("\n[4/8] Copying hook files...")
     copy_hooks(python_exe)
 
-    print("\n[4/7] Updating settings.json...")
+    print("\n[5/8] Updating settings.json...")
     merge_settings(python_exe)
 
-    print("\n[5/7] Initializing database...")
+    print("\n[6/8] Initializing database...")
     apply_sql_migrations()
     init_database()
 
-    print("\n[6/7] Running smoke test...")
+    print("\n[7/8] Running smoke test...")
     if smoke_test(python_exe):
         print("  PASS")
     else:
@@ -606,7 +745,7 @@ def main(argv=None) -> None:
         print(f"    {python_exe} {HOOKS_DIR / 'drachometer-log-usage.py'} stop")
         sys.exit(1)
 
-    print("\n[7/7] Configuring mesh replication...")
+    print("\n[8/8] Configuring mesh replication...")
     configure_mesh(args)
 
     print("\n" + "=" * 40)
