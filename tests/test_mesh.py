@@ -166,17 +166,21 @@ class MeshTestBase(unittest.TestCase):
         env = os.environ.copy()
         pass_fds = []
         if listen_socket is not None:
-            fd = listen_socket.fileno()
             if os.name != 'nt':
+                fd = listen_socket.fileno()
                 os.set_inheritable(fd, True)
                 pass_fds.append(fd)
-            env["MESH_LISTEN_FD"] = str(fd)
-        
+                env["MESH_LISTEN_FD"] = str(fd)
+            else:
+                # Windows socket handles aren't CRT file descriptors, so
+                # os.set_inheritable()/pass_fds can't hand them to a child
+                # process. Release the reservation and let the child bind
+                # the (now free) port itself.
+                listen_socket.close()
+
         kwargs = {}
         if os.name != 'nt':
             kwargs['pass_fds'] = pass_fds
-        else:
-            kwargs['close_fds'] = False
 
         proc = subprocess.Popen(
             [sys.executable, "-c", self._mesh_server_script(db_path, config_path, log_path)],
