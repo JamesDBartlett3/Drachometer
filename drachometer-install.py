@@ -41,7 +41,7 @@ REPO_SERVER = Path(__file__).resolve().parent / "drachometer-serve-dashboard.py"
 REPO_MESH = Path(__file__).resolve().parent / "drachometer_mesh.py"
 
 REPO_README = Path(__file__).resolve().parent / "README.md"
-REPO_COIN = Path(__file__).resolve().parent / "coin.svg"
+REPO_LOGO = Path(__file__).resolve().parent / "drachometer-logo.svg"
 REPO_VERSION = Path(__file__).resolve().parent / "drachometer-version.json"
 REPO_PRICING = Path(__file__).resolve().parent / "drachometer-pricing.json"
 
@@ -54,7 +54,7 @@ HOOK_FILES = {
     "drachometer_mesh.py": REPO_MESH,
     "drachometer-dashboard.html": REPO_DASHBOARD,
     "README.md": REPO_README,
-    "coin.svg": REPO_COIN,
+    "drachometer-logo.svg": REPO_LOGO,
     "drachometer-version.json": REPO_VERSION,
     "drachometer-pricing.json": REPO_PRICING,
 }

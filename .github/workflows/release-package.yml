@@ -20,7 +20,7 @@ jobs:
           mkdir -p dist
           zip -r dist/drachometer.zip \
             README.md \
-            coin.svg \
+            drachometer-logo.svg \
             hooks \
             drachometer-install.bat \
             drachometer-install.ps1 \

@@ -1,6 +1,6 @@
 # Drachometer
 
-![Coin logo](coin.svg)
+![Drachometer logo](drachometer-logo.svg)
 
 Drachometer: "drachma" (ancient Greek currency) + "meter" = a token usage meter for Claude Code.
 
@@ -405,7 +405,7 @@ drachometer_mesh.py                 # Mesh replication library + CLI (opt-in, LA
 drachometer-dashboard.html             # Browser dashboard (sql.js + Chart.js)
 drachometer-pricing.json            # Per-tier model pricing (single source of truth)
 drachometer-version.json # App version + GitHub release metadata
-coin.svg                # Logo / favicon artwork
+drachometer-logo.svg    # Logo / favicon artwork
 scripts/drachometer-update-pricing.py             # Scrapes Anthropic pricing -> drachometer-pricing.json
 .github/workflows/release-package.yml # Publishes the release zip asset
 .github/workflows/update-pricing.yml  # Weekly pricing refresh (commits drachometer-pricing.json)
