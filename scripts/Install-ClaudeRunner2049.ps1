@@ -1,12 +1,10 @@
 #Requires -Version 5
 <#
-This script installs a background helper that pings the claude CLI once at logon/unlock and then every 
-~5 hours until midnight, to proactively start Claude's rolling 5-hour usage window on a predictable schedule 
-rather than whenever you happen to send your first real prompt of the day.
+What is this script for?
+This script installs a background helper that pings the Claude Code CLI when you logon/unlock in the morning, and then every 5 hours after that until midnight, or until you shut off your computer for the day, whichever comes first.
 
-Self-contained self-elevating installer script: 
-- creates ClaudeRunner2049.vbs VBScript file
-- registers the "ClaudeRunner 2049" scheduled task
+Why is this useful?
+Claude usage is limited to a certain amount of tokens per 5-hour window, but that window only starts counting when you send your first prompt after the previous 5-hour window expires. Consequently, the time between logging on and sending your first prompt for the day is time you're not accumulating toward a fresh window. Similarly, any time between the end of a 5-hour window and the start of your next prompt is time you're not accumulating toward your next 5-hour window. This script ensures that you are always accumulating toward a fresh window, regardless of the time of day when you send your first prompt, and regardless of any delay between the end of one 5-hour window and the start of your next prompt. By pinging immediately at logon and again the instant each 5-hour window expires, the clock is always running in the background, maximizing how many full 5-hour windows fall within your normal working day.
 #>
 
 $ErrorActionPreference = 'Stop'
@@ -18,9 +16,9 @@ if (-not $isAdmin) {
 }
 
 $destDir = 'C:\tools\startup'
-$vbsPath = Join-Path $destDir 'ClaudeRunner2049.vbs'
-$xmlPath = Join-Path $env:TEMP 'ClaudeRunner2049.xml'
-$taskName = 'ClaudeRunner 2049'
+$vbsPath = Join-Path $destDir 'Claude Runner 2049.vbs'
+$xmlPath = Join-Path $env:TEMP 'Claude Runner 2049.xml'
+$taskName = 'Claude Runner 2049'
 
 New-Item -ItemType Directory -Force -Path $destDir | Out-Null
 
