@@ -112,6 +112,29 @@ def detect_installed_version() -> str:
     return "0.0.0"
 
 
+def write_installed_version(version: str | None = None) -> None:
+    """Persist the current app version into both the modern and legacy install paths."""
+    next_version = str(version or APP_VERSION or "0.0.0").strip() or "0.0.0"
+    for version_path in (VERSION_PATH, LEGACY_VERSION_PATH):
+        try:
+            version_path.parent.mkdir(parents=True, exist_ok=True)
+            # Preserve existing metadata fields (releases_api, releases_url, etc.)
+            # so downstream consumers (e.g. checkForUpdates) continue to work.
+            try:
+                payload = json.loads(version_path.read_text(encoding="utf-8"))
+                if not isinstance(payload, dict):
+                    payload = dict(APP_METADATA)
+            except (OSError, json.JSONDecodeError, ValueError):
+                payload = dict(APP_METADATA)
+            payload["version"] = next_version
+            version_path.write_text(
+                json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
+
+
 # --------------------------------------------------------------------------- #
 # Running-instance detection
 #
@@ -473,6 +496,7 @@ def copy_hooks(python_exe: str) -> None:
         dst = HOOKS_DIR / name
         shutil.copy2(src, dst)
         print(f"  Copied {name} -> {dst}")
+    write_installed_version(APP_VERSION)
 
 
 def build_hook_commands(python_exe: str) -> dict:
