@@ -10,6 +10,7 @@ prior running instance before it overwrites files.
 
 import json
 import os
+import sqlite3
 import sys
 import threading
 import time
@@ -43,12 +44,44 @@ _db_mtime = 0.0
 _db_mtime_lock = threading.Lock()
 
 
+def _checkpoint_wal():
+    """Flush committed WAL pages into the main file before serving raw bytes.
+
+    ``/drachometer.db`` sends the main file's bytes directly; in WAL mode that
+    file lags behind reality until a checkpoint happens, so without this a
+    client can refetch right after an SSE "refresh" and still get a snapshot
+    missing the very writes that triggered the refresh. PASSIVE only flushes
+    what it can without blocking concurrent readers/writers, so it's safe to
+    run on every request.
+    """
+    try:
+        conn = sqlite3.connect(str(DB_PATH), timeout=2)
+        try:
+            conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        pass
+
+
 def _watch_db():
-    """Background thread: update _db_mtime when the DB file changes."""
+    """Background thread: update _db_mtime when the DB file changes.
+
+    The DB runs in WAL mode, so ordinary writes land in the ``-wal`` sidecar
+    and don't touch the main file's mtime until SQLite gets around to an
+    autocheckpoint -- which can be minutes away under light write volume.
+    Watching only the main file's mtime left the dashboard's SSE refresh
+    silently stuck for as long as the wal file was under the autocheckpoint
+    threshold, even while turns kept being recorded. Watching the wal file's
+    mtime too makes every write visible immediately.
+    """
     global _db_mtime
+    wal_path = DB_PATH.with_name(DB_PATH.name + "-wal")
     while True:
         try:
             mt = DB_PATH.stat().st_mtime if DB_PATH.exists() else 0.0
+            if wal_path.exists():
+                mt = max(mt, wal_path.stat().st_mtime)
             with _db_mtime_lock:
                 _db_mtime = mt
         except OSError:
@@ -85,6 +118,7 @@ class Handler(SimpleHTTPRequestHandler):
 
         if path == "/drachometer.db":
             if DB_PATH.exists():
+                _checkpoint_wal()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/octet-stream")
                 data = DB_PATH.read_bytes()

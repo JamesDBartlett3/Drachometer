@@ -8,6 +8,8 @@ A Claude Code hook that logs every turn and tool call to a local SQLite database
 
 ![Dashboard](https://img.shields.io/badge/dashboard-localhost:9873-c87533)
 
+<img alt="Dashboard screenshot" src="screenshots/drachometer-screenshot.png" />
+
 ## One-Line Install (Windows PowerShell)
 
 ```powershell
@@ -56,8 +58,6 @@ DRACHOMETER_ARCHIVE_URL="file:///path/to/drachometer.zip" \
 That's it. Usage is logged automatically from that point on.
 
 > The installer finds your Python interpreter, copies hook scripts to `~/.claude/hooks/drachometer/`, registers them in `~/.claude/settings.json`, creates the database, and runs a smoke test. Any existing hooks are left in place.
-
-<img alt="Dashboard screenshot" src="screenshots/drachometer-screenshot.png" />
 
 ## Dashboard Features
 
