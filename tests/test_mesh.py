@@ -839,6 +839,37 @@ class TestPropagationTracking(MeshTestBase):
         )
         self.assertIsNone(mesh.mean_propagation_seconds())
 
+    def test_existing_propagation_ids_seeds_backlog_for_restart(self):
+        # Regression test: restarting the mesh used to wipe prop_recorded and
+        # re-time already-propagated backlog events using their true (old)
+        # created_at, inflating "Mean propagation" with calendar age/downtime
+        # instead of real replication latency. start_mesh() now seeds
+        # prop_recorded with _existing_propagation_ids() so backlog present at
+        # startup is never (re)timed as a fresh completion.
+        db = self.tmp / "seed.db"
+        conn = sqlite3.connect(db)
+        try:
+            mesh.ensure_schema(conn)
+            old_ts = (datetime.now(timezone.utc) - timedelta(hours=23)).isoformat()
+            conn.execute(
+                "INSERT INTO oplog (event_id, origin_node, lamport, created_at, entity, op, payload) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                ("stale-1", "nodeA", 1, old_ts, "turn", "upsert", "{}"),
+            )
+            conn.commit()
+            seeded = mesh._existing_propagation_ids(conn, "nodeA")
+            self.assertIn("stale-1", seeded)
+
+            # Simulate what start_mesh() now does before the daemon's first
+            # sync round: seed prop_recorded from the backlog up front.
+            mesh._RUNTIME["prop_recorded"] = seeded
+            rows = [("stale-1", old_ts)]
+            peer_has = {"p1": {"stale-1"}}  # peer already fully caught up
+            recorded = mesh._record_propagations(rows, peer_has, mesh.time.time())
+            self.assertEqual(recorded, 0)  # not (re)timed -- it's pre-existing backlog
+            self.assertIsNone(mesh.mean_propagation_seconds())
+        finally:
+            conn.close()
+
 
 class TestRuntimeControl(MeshTestBase):
     def setUp(self):

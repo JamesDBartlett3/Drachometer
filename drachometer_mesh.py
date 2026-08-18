@@ -1137,6 +1137,7 @@ def start_mesh(app_version: str = "", db_path: Path | None = None, inherited_soc
 
     with _db(db_path) as conn:
         ensure_schema(conn)
+        seed_prop_ids = _existing_propagation_ids(conn, cfg["node_id"])
 
     registry = _PeerRegistry(cfg)
     host = cfg.get("listen_host", "0.0.0.0")
@@ -1159,7 +1160,7 @@ def start_mesh(app_version: str = "", db_path: Path | None = None, inherited_soc
         _RUNTIME["started_at"] = time.time()
         _RUNTIME["active_peers"] = {}
         _RUNTIME["prop_seconds"] = deque(maxlen=PROPAGATION_WINDOW)
-        _RUNTIME["prop_recorded"] = set()
+        _RUNTIME["prop_recorded"] = seed_prop_ids
 
     def _daemon():
         _announce(cfg, registry)  # startup registration
@@ -1533,6 +1534,24 @@ def _update_liveness_and_propagation(cfg: dict, registry: _PeerRegistry) -> None
     except sqlite3.Error:
         return
     _record_propagations(rows, peer_has, now)
+
+
+def _existing_propagation_ids(conn: sqlite3.Connection, node_id: str) -> set[str]:
+    """Event ids already sitting in the oplog for ``node_id``.
+
+    Seeded into ``prop_recorded`` on mesh (re)start so a restart doesn't treat
+    already-propagated backlog as a fresh completion and time it from its true
+    (possibly very old) ``created_at`` -- that's what previously inflated
+    "Mean propagation" to reflect calendar age / peer downtime instead of
+    actual replication latency.
+    """
+    return {
+        row[0] for row in conn.execute(
+            "SELECT event_id FROM oplog WHERE origin_node = ? "
+            "ORDER BY lamport DESC LIMIT ?",
+            (node_id, PROPAGATION_WINDOW * 4),
+        )
+    }
 
 
 def _record_propagations(rows, peer_has: dict[str, set[str]], now: float) -> int:
