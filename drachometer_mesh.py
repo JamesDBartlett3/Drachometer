@@ -526,10 +526,27 @@ def tool_call_payload(row: dict) -> dict:
     }
 
 
+def is_synthetic_session(session_id: str | None) -> bool:
+    """True for reserved test/internal session ids (e.g. '__install_test__').
+
+    Real Claude Code session ids are UUIDs; this dunder convention lets any
+    smoke test or manual debugging probe opt out of replication just by naming
+    its session_id this way. Checked both when emitting (so this node never
+    replicates one out) and when projecting an incoming event (so a synthetic
+    id already sitting in a peer's oplog -- or this node's own history -- can
+    never be materialized into turns/tool_calls, no matter how many times it
+    gets synced).
+    """
+    session_id = session_id or ""
+    return session_id.startswith("__") and session_id.endswith("__")
+
+
 # --------------------------------------------------------------------------- #
 # Event application (idempotent projection into base tables)
 # --------------------------------------------------------------------------- #
 def _project_turn(conn: sqlite3.Connection, p: dict) -> bool:
+    if is_synthetic_session(p.get("session_id")):
+        return False
     model_id = ensure_model_row(conn, p.get("model_key"))
     existing = conn.execute(
         "SELECT recorded_at FROM turns WHERE session_id = ? AND turn_id = ?",
@@ -576,6 +593,8 @@ def _project_turn(conn: sqlite3.Connection, p: dict) -> bool:
 
 
 def _project_tool_call(conn: sqlite3.Connection, p: dict) -> bool:
+    if is_synthetic_session(p.get("session_id")):
+        return False
     # Resolve the local turn primary key from the global natural key. May be
     # NULL if the parent turn has not replicated yet; queries can still join on
     # (session_id, turn_id), which is carried on every tool_call row.
