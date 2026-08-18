@@ -68,7 +68,7 @@ $xml = @"
   <Principals>
     <Principal id="Author">
       <UserId>$currentUserSid</UserId>
-      <LogonType>InteractiveToken</LogonType>
+      <LogonType>S4U</LogonType>
       <RunLevel>LeastPrivilege</RunLevel>
     </Principal>
   </Principals>
