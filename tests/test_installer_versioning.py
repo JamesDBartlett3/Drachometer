@@ -30,14 +30,21 @@ class InstallerVersioningTest(unittest.TestCase):
             installer.LEGACY_VERSION_PATH = legacy_version_path
 
             version_path.parent.mkdir(parents=True, exist_ok=True)
-            version_path.write_text(json.dumps({"version": "0.0.1"}) + "\n", encoding="utf-8")
+            stale = {"version": "0.0.1", "releases_api": "https://api.example.com", "repository": "owner/repo"}
+            version_path.write_text(json.dumps(stale) + "\n", encoding="utf-8")
             legacy_version_path.parent.mkdir(parents=True, exist_ok=True)
-            legacy_version_path.write_text(json.dumps({"version": "0.0.1"}) + "\n", encoding="utf-8")
+            legacy_version_path.write_text(json.dumps(stale) + "\n", encoding="utf-8")
 
             installer.write_installed_version("2.3.4")
 
-            self.assertEqual(json.loads(version_path.read_text(encoding="utf-8"))["version"], "2.3.4")
-            self.assertEqual(json.loads(legacy_version_path.read_text(encoding="utf-8"))["version"], "2.3.4")
+            data = json.loads(version_path.read_text(encoding="utf-8"))
+            self.assertEqual(data["version"], "2.3.4")
+            # Existing metadata fields must be preserved so checkForUpdates() keeps working.
+            self.assertEqual(data["releases_api"], "https://api.example.com")
+            self.assertEqual(data["repository"], "owner/repo")
+            legacy_data = json.loads(legacy_version_path.read_text(encoding="utf-8"))
+            self.assertEqual(legacy_data["version"], "2.3.4")
+            self.assertEqual(legacy_data["releases_api"], "https://api.example.com")
 
     def test_copy_hooks_rewrites_version_metadata(self):
         with tempfile.TemporaryDirectory() as tmpdir:
