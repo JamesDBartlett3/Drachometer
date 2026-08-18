@@ -1,6 +1,6 @@
 # Drachometer
 
-![Drachometer logo](drachometer-logo.svg)
+<img src="drachometer-logo.svg" alt="Drachometer logo" width="38" height="38" />
 
 Drachometer: "drachma" (ancient Greek currency) + "meter" = a token usage meter for Claude Code.
 
@@ -57,7 +57,7 @@ That's it. Usage is logged automatically from that point on.
 
 > The installer finds your Python interpreter, copies hook scripts to `~/.claude/hooks/drachometer/`, registers them in `~/.claude/settings.json`, creates the database, and runs a smoke test. Any existing hooks are left in place.
 
-<img width="3679" height="1912" alt="image" src="https://github.com/user-attachments/assets/57220cd7-8097-4d57-ab61-546ab50af504" />
+<img alt="Dashboard screenshot" src="screenshots/drachometer-screenshot.png" />
 
 ## Dashboard Features
 
