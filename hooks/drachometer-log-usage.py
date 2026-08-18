@@ -391,6 +391,16 @@ def mesh_node_id() -> str | None:
     return None
 
 
+def is_synthetic_session(session_id: str) -> bool:
+    """True for reserved test/internal session ids (e.g. '__install_test__').
+
+    Real Claude Code session ids are UUIDs; this dunder convention lets any
+    smoke test or manual debugging probe opt out of mesh replication just by
+    naming its session_id this way, without needing a code change per test.
+    """
+    return session_id.startswith("__") and session_id.endswith("__")
+
+
 def handle_stop(conn: sqlite3.Connection, payload: dict, mesh_node: str | None = None) -> None:
     session_id = payload.get("session_id", "unknown")
     turn_id = derive_turn_id(payload)
@@ -478,7 +488,7 @@ def handle_stop(conn: sqlite3.Connection, payload: dict, mesh_node: str | None =
                 (turn_pk, session_id, turn_num),
             )
 
-    if mesh_node and mesh is not None:
+    if mesh_node and mesh is not None and not is_synthetic_session(session_id):
         try:
             mesh.emit_event(conn, mesh_node, "turn", mesh.turn_payload({
                 "session_id": session_id,
@@ -544,7 +554,7 @@ def handle_post_tool_use(conn: sqlite3.Connection, payload: dict, mesh_node: str
         error_text,
     ))
 
-    if mesh_node and mesh is not None:
+    if mesh_node and mesh is not None and not is_synthetic_session(session_id):
         try:
             mesh.emit_event(conn, mesh_node, "tool_call", mesh.tool_call_payload({
                 "uid": uid,
