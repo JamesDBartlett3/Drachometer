@@ -1291,7 +1291,10 @@ def list_local_interfaces() -> list[tuple[str, int]]:
         ]
     for argv, parser in commands:
         try:
-            proc = subprocess.run(argv, capture_output=True, text=True, timeout=5)
+            proc = subprocess.run(
+                argv, capture_output=True, text=True, timeout=5,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
         except (OSError, subprocess.SubprocessError):
             continue
         if not proc.stdout:
