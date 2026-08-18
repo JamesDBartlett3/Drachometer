@@ -1,0 +1,73 @@
+name: Prepare release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "New version, no leading v (e.g. 1.2.0)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  bump-and-tag:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Validate version format
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Version '$VERSION' is not in X.Y.Z format"
+            exit 1
+          fi
+
+      - name: Check out repository
+        uses: actions/checkout@v6.0.3
+
+      - name: Check tag does not already exist
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if git rev-parse "v$VERSION" >/dev/null 2>&1; then
+            echo "::error::Tag v$VERSION already exists"
+            exit 1
+          fi
+
+      - name: Bump drachometer-version.json
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          jq --arg v "$VERSION" '.version = $v' drachometer-version.json > drachometer-version.json.tmp
+          mv drachometer-version.json.tmp drachometer-version.json
+
+      - name: Commit and tag
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "chore: bump version to $VERSION"
+          git tag "v$VERSION"
+          git push origin HEAD:main
+          git push origin "v$VERSION"
+
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          gh release create "v$VERSION" \
+            --draft \
+            --title "v$VERSION" \
+            --generate-notes \
+            --target main
+
+      - name: Summary
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          echo "Committed and tagged v$VERSION on main, and opened a draft release." >> "$GITHUB_STEP_SUMMARY"
+          echo "Next: go to Releases, open the v$VERSION draft, review the notes, and publish." >> "$GITHUB_STEP_SUMMARY"

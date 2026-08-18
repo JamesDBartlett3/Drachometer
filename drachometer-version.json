@@ -1,6 +1,7 @@
 {
+  "_comment": "Do not hand-edit 'version' — run the 'Prepare release' GitHub Actions workflow instead. See .github/RELEASING.md.",
   "name": "drachometer",
-  "version": "0.0.1",
+  "version": "0.0.3",
   "repository": "JamesDBartlett3/drachometer",
   "releases_api": "https://api.github.com/repos/JamesDBartlett3/drachometer/releases/latest",
   "releases_url": "https://github.com/JamesDBartlett3/drachometer/releases/latest"

@@ -4,35 +4,41 @@ This document explains how to publish a new release and how the GitHub Actions r
 
 ## Overview
 
-When you publish a GitHub Release, the **Release package** workflow automatically builds and attaches a zip asset to that release. The one-line installers (`drachometer-install.sh` and `drachometer-install.ps1`) then resolve the latest release via the GitHub Releases API and install from that zip.
+Releasing is two automated steps, so the version number is never hand-typed into a file and never has a chance to drift from the release tag:
 
-## Pre-release checklist
+1. **Prepare release**, which you trigger manually from the Actions tab, bumps `drachometer-version.json` on `main`, creates the tag from that same commit, and opens a draft release on that tag, all in one job. The commit, the tag, and the draft are produced by the same script from the same input, so they cannot disagree.
+2. **Release package** (fires on publishing that GitHub Release) re-stamps `drachometer-version.json` from the release's tag name as a belt-and-suspenders check, then builds and attaches the zip asset. The one-line installers (`drachometer-install.sh` and `drachometer-install.ps1`) resolve the latest release via the GitHub Releases API and install from that zip.
 
-1. Update `drachometer-version.json` with the new semver version string (e.g. `"version": "1.2.0"`).
-2. Commit and push all changes to the default branch (`main`).
-3. Confirm the `workflows/release-package.yml` workflow file is present on `main` — GitHub Actions only executes workflows that exist on the default branch.
+## Cutting a release
 
-## Publishing a release
+1. Go to **GitHub → Actions → Prepare release → Run workflow**, enter the new version with no leading `v` (e.g. `1.2.0`), and run it. This commits the version bump to `main`, pushes tag `v1.2.0`, and opens a draft release on that tag with auto-generated notes.
+2. Go to **GitHub → Releases**, open the `v1.2.0` draft, review/edit the auto-generated notes and title.
+3. Click **Publish release** (not _Save draft_).
 
-1. Go to **GitHub → Releases → Draft a new release**.
-2. Click **Choose a tag** and type the new version prefixed with `v` (e.g. `v1.2.0`), then select **Create new tag on publish**.
-3. Set the target to `main` (or the commit you want to release).
-4. Fill in the release title and release notes.
-5. Click **Publish release** (not _Save draft_).
+> **Important:** The Release package workflow only triggers on `published`, not on draft releases. Do not click _Publish_ until the release notes are final.
 
-> **Important:** The workflow only triggers on `published`, not on draft releases. Do not click _Publish_ until the release notes and tag are final.
+## What the workflows do
 
-## What the workflow does
+### Prepare release — `.github/workflows/prepare-release.yml`
 
-File: `.github/workflows/release-package.yml`
+| Step                | What happens                                                                                              |
+| ------------------- | ---------------------------------------------------------------------------------------------------------- |
+| Validate version     | Fails fast if the input isn't `X.Y.Z`                                                                      |
+| Check tag free       | Fails if `vX.Y.Z` already exists, so a typo can't silently overwrite an existing release's tag             |
+| Bump version.json    | Sets `.version` in `drachometer-version.json` to the input                                                 |
+| Commit and tag       | Commits the bump to `main` and creates `vX.Y.Z` on that same commit, then pushes both                      |
+| Create draft release | Opens a **draft** GitHub Release on tag `vX.Y.Z` with auto-generated notes (`gh release create --draft --generate-notes`) — nothing is public yet |
+
+### Release package — `.github/workflows/release-package.yml`
 
 | Step         | What happens                                                                                                                                                                                                                                                                                                             |
 | ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Trigger      | Fires on `release: types: [published]`                                                                                                                                                                                                                                                                                   |
-| Permissions  | `contents: write` (needed to upload the release asset)                                                                                                                                                                                                                                                                   |
-| Check out    | Checks out the repository at the tagged commit                                                                                                                                                                                                                                                                           |
-| Build zip    | Creates `dist/drachometer.zip` containing: `README.md`, `drachometer-logo.svg`, `hooks/`, `drachometer-install.bat`, `drachometer-install.ps1`, `drachometer-install.py`, `drachometer-install.sh`, `migrations/`, `drachometer-dashboard.html`, `drachometer-serve-dashboard.py`, `drachometer_mesh.py`, `drachometer-version.json` |
-| Upload asset | Attaches the zip to the published release via `softprops/action-gh-release`                                                                                                                                                                                                                                              |
+| Trigger       | Fires on `release: types: [published]`                                                                                                                                                                                                                                                                                   |
+| Permissions   | `contents: write` (needed to upload the release asset)                                                                                                                                                                                                                                                                   |
+| Check out     | Checks out the repository at the tagged commit                                                                                                                                                                                                                                                                           |
+| Stamp version | Overwrites the `version` field in `drachometer-version.json` with the release's tag name (e.g. `v1.2.0` → `1.2.0`) — redundant when the tag came from Prepare release, but keeps a manually-pushed tag honest too                                                                                                      |
+| Build zip     | Creates `dist/drachometer.zip` containing: `README.md`, `drachometer-logo.svg`, `hooks/`, `drachometer-install.bat`, `drachometer-install.ps1`, `drachometer-install.py`, `drachometer-install.sh`, `migrations/`, `drachometer-dashboard.html`, `drachometer-serve-dashboard.py`, `drachometer_mesh.py`, `drachometer-version.json` |
+| Upload asset  | Attaches the zip to the published release via `softprops/action-gh-release`                                                                                                                                                                                                                                              |
 
 The zip intentionally omits development-only files (`.github/`, `.git/`, `screenshots/`, etc.) so users receive only what is needed to install and run the dashboard.
 
