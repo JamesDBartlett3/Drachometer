@@ -142,11 +142,12 @@ During install/upgrade, `drachometer-install.py`:
    - Database schema migration/backfill via normal DB initialization.
 3. Copies the latest files and writes the new version metadata.
 
-The SQL migration file is still available for manual use when needed:
+The SQL migration files are still available for manual use when needed, applied in order and tracked in a `schema_migrations` table so each runs at most once:
 
-`migrations/001_migrate_to_model_dimension.sql`
+- `migrations/001_migrate_to_model_dimension.sql`
+- `migrations/002_add_mesh_oplog.sql` — adds the mesh replication `oplog` table and a global `uid` for `tool_calls` (see [Mesh Replication](#mesh-replication-lanvm))
 
-That script performs the model-dimension migration in one transaction by:
+`001` performs the model-dimension migration in one transaction by:
 
 1. Creates `models` if it does not exist.
 2. Adds `turns.model_id` as a foreign key to `models(id)`.
@@ -240,8 +241,9 @@ Recommended manual upgrade procedure (if you run SQL migration directly):
 1. Stop Claude Code so no writes occur during migration.
 2. Back up the database:
    - `cp ~/.claude/drachometer.db ~/.claude/drachometer.db.bak`
-3. Run the migration script:
+3. Run the migration scripts, in order:
    - `sqlite3 ~/.claude/drachometer.db < migrations/001_migrate_to_model_dimension.sql`
+   - `sqlite3 ~/.claude/drachometer.db < migrations/002_add_mesh_oplog.sql`
 4. Verify migration results:
    - `SELECT COUNT(*) FROM turns WHERE model IS NOT NULL AND TRIM(model) <> '' AND model_id IS NULL;` (should be `0`)
    - `SELECT COUNT(*) FROM turns t LEFT JOIN models m ON m.id = t.model_id WHERE t.model_id IS NOT NULL AND m.id IS NULL;` (should be `0`)
@@ -254,27 +256,39 @@ All per-token pricing lives in one place — [`drachometer-pricing.json`](dracho
 ```json
 {
   "tiers": {
+    "fable": {
+      "model": "claude-fable-5",
+      "input": 10.0,
+      "output": 50.0,
+      "cache_read": 1.0,
+      "cache_create": 12.5
+    },
     "opus": {
-      "input": 5,
-      "output": 25,
+      "model": "claude-opus-5",
+      "input": 5.0,
+      "output": 25.0,
       "cache_read": 0.5,
       "cache_create": 6.25
     },
     "sonnet": {
-      "input": 3,
-      "output": 15,
-      "cache_read": 0.3,
-      "cache_create": 3.75
+      "model": "claude-sonnet-5",
+      "input": 2.0,
+      "output": 10.0,
+      "cache_read": 0.2,
+      "cache_create": 2.5
     },
     "haiku": {
-      "input": 1,
-      "output": 5,
+      "model": "claude-haiku-4-5-20251001",
+      "input": 1.0,
+      "output": 5.0,
       "cache_read": 0.1,
       "cache_create": 1.25
     }
   }
 }
 ```
+
+> Pricing is scraped and committed weekly (see below), so the numbers above may already be stale — [`drachometer-pricing.json`](drachometer-pricing.json) is always the source of truth.
 
 The tier is inferred from the model key (e.g. `claude-sonnet-4-6` → Sonnet). The same file is read by all three components, so they never disagree:
 
@@ -392,6 +406,29 @@ New-NetFirewallRule -DisplayName "Drachometer mesh" -Direction Inbound -Protocol
 
 A new or long-offline node converges automatically on the next gossip round — its first anti-entropy pass pulls the full event history (the bootstrap snapshot), and subsequent rounds catch up incrementally. If a node's database is lost, reinstall, re-`join` the mesh with the same mesh id, and it will re-pull everyone's history. Diagnostics are written to `~/.claude/drachometer-mesh.log`.
 
+## Keep-Alive Scheduled Task (Windows, Optional)
+
+> **Status:** Opt-in, run manually. Not part of the installer and unrelated to logging — it just keeps your 5-hour usage window rolling.
+
+Claude's 5-hour usage window only starts counting from your first prompt, so any gap between logon and that first prompt — or between one window expiring and your next prompt — is dead time that never counts toward a window. [`scripts/Install-ClaudeRunner2049.ps1`](scripts/Install-ClaudeRunner2049.ps1) sets up a Windows Scheduled Task that keeps a background loop checking in every minute, so a fresh window starts ticking within a minute of the last one expiring — without needing you to lock your screen or log on again to trigger it (see the caveat below on how long that holds without either).
+
+Run it once, elevated (it self-elevates via UAC if needed):
+
+```powershell
+powershell -File scripts\Install-ClaudeRunner2049.ps1
+```
+
+It registers a scheduled task named **Claude Runner 2049** that:
+
+- Triggers at logon and on session unlock, running as your user account (no stored password).
+- Runs `C:\tools\startup\Claude Runner 2049.vbs`, which checks every minute (for up to 24 hours per instance) whether 5+ hours have passed since the last recorded ping — reading/writing that timestamp to `C:\tools\startup\claude-runner-last-ping.txt` — and if so, sends `claude --safe-mode --no-session-persistence --disable-slash-commands --effort low --model haiku -p hi`.
+- Allows multiple instances to run at once (`MultipleInstancesPolicy=Parallel`), so a stale "still running" state can never block a fresh start; each instance also kills any older copies of itself on startup (matched by command line via WMI, using process creation time — not PID, which Windows recycles) so normally only one loop is ever actually doing the work.
+- Keeps running on battery power — laptops that hop between AC and battery all day shouldn't lose keep-alive coverage over it.
+
+> **Caveat:** each instance checks for up to 24 hours before exiting, and only logon/unlock restarts it. If you stay logged in and unlocked for more than 24 straight hours, checks stop until your next logon/unlock. In practice this shouldn't come up — everyone locks their workstation at least once a day for a break — but it's worth knowing about.
+
+This is a personal convenience script, independent of Drachometer. The `--safe-mode` flag disables hooks (along with plugins, skills, MCP servers, and CLAUDE.md), and `--no-session-persistence` skips writing a transcript to disk at all — so Drachometer's Stop hook never fires for these pings, and there'd be nothing for it to read even if it did. That's deliberate, for two reasons: every active feature (hooks, skills, MCP, etc.) burns extra tokens the ping doesn't need, and Drachometer's dashboard is meant to reflect your deliberate, active usage — not a background job's minimal keep-alive traffic. Nothing about this script requires Drachometer to be installed.
+
 ## Files
 
 ```
@@ -406,9 +443,12 @@ drachometer-dashboard.html             # Browser dashboard (sql.js + Chart.js)
 drachometer-pricing.json            # Per-tier model pricing (single source of truth)
 drachometer-version.json # App version + GitHub release metadata
 drachometer-logo.svg    # Logo / favicon artwork
+migrations/                         # SQL schema migrations, applied automatically on install/upgrade
 scripts/drachometer-update-pricing.py             # Scrapes Anthropic pricing -> drachometer-pricing.json
+scripts/Install-ClaudeRunner2049.ps1  # Optional Windows scheduled task (see Keep-Alive Scheduled Task)
 .github/workflows/release-package.yml # Publishes the release zip asset
 .github/workflows/update-pricing.yml  # Weekly pricing refresh (commits drachometer-pricing.json)
+.github/workflows/prepare-release.yml # Bumps version, tags, and opens a draft release
 ```
 
 ## Installed Locations
