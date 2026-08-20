@@ -73,7 +73,7 @@ $xml = @"
     </Principal>
   </Principals>
   <Settings>
-    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <MultipleInstancesPolicy>StopExisting</MultipleInstancesPolicy>
     <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
     <StopIfGoingOnBatteries>true</StopIfGoingOnBatteries>
     <AllowHardTerminate>true</AllowHardTerminate>
