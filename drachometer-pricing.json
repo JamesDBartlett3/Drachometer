@@ -1,7 +1,7 @@
 {
   "_comment": "Per-tier token pricing in USD per 1,000,000 tokens. This file is the single source of truth for pricing across the dashboard, hook, and installer. It is refreshed automatically by .github/workflows/update-pricing.yml (which scrapes Anthropic's published pricing). If the scrape breaks, the workflow fails (notifying maintainers) and these last-good values stay in effect. cache_read is ~0.1x input and cache_create is ~1.25x input by Anthropic's standard prompt-caching pricing.",
   "source": "https://docs.claude.com/en/docs/about-claude/pricing.md",
-  "updated": "2026-08-17",
+  "updated": "2026-08-24",
   "tiers": {
     "fable": {
       "model": "claude-fable-5",
