@@ -1,7 +1,7 @@
 #Requires -Version 5
 <#
 What is this script for?
-This script installs a background helper that checks in every minute; if 5+ hours have passed since the last ping (or it has never pinged), it pings the Claude Code CLI and records the new timestamp to a small state file. It starts at logon and on screen unlock. Task Scheduler is always allowed to start a new instance, even if it believes an older one is still running (MultipleInstancesPolicy=Parallel), so a stale "still running" flag can never block it. On startup, each instance kills any older copies of itself (matched by command line via WMI) so at most one loop is doing the work at a time; that cleanup is a courtesy, not a requirement -- the state file makes every check idempotent, so a brief overlap between an old and new instance is harmless either way.
+This script installs a background helper that checks in every minute; if 5+ hours have passed since the last ping (or it has never pinged), it pings the Claude Code CLI and records the new timestamp to a small state file. It starts at logon and on screen unlock. Task Scheduler is always allowed to start a new instance, even if it believes an older one is still running (MultipleInstancesPolicy=Parallel), so a stale "still running" flag can never block it. On startup, each instance kills any older copies of itself (matched by command line via WMI) so at most one loop is doing the work at a time; that cleanup is a courtesy, not a requirement -- the state file makes every check idempotent, so a brief overlap between an old and new instance is harmless either way. If a ping fails because the OAuth session has expired, it opens a visible Claude window for the user to sign back in, waits for that window to close, and retries -- the state file is only updated once a ping actually succeeds, so a failed ping is retried on the next check instead of silently going dark for 5 hours.
 
 Why is this useful?
 Claude usage is limited to a certain amount of tokens per 5-hour window, but that window only starts counting when you send your first prompt after the previous 5-hour window expires. Consequently, the time between logging on and sending your first prompt for the day is time you're not accumulating toward a fresh window. Similarly, any time between the end of a 5-hour window and the start of your next prompt is time you're not accumulating toward your next 5-hour window. This script ensures that you are always accumulating toward a fresh window, regardless of the time of day when you send your first prompt, and regardless of any delay between the end of one 5-hour window and the start of your next prompt. By checking every minute and pinging as soon as the state file shows a window has expired, the clock stays fresh across the day to within a minute -- whether or not you ever lock your screen -- resuming from wherever it left off, even after sleep, hibernation, or a missed check.
@@ -24,12 +24,13 @@ $taskName = 'Claude Runner 2049'
 New-Item -ItemType Directory -Force -Path $destDir | Out-Null
 
 @"
-Dim objShell, objFSO, stateFile, command, startTime
+Dim objShell, objFSO, stateFile, pingCommand, pingOutputFile, startTime
 
 Set objShell = CreateObject("WScript.Shell")
 Set objFSO = CreateObject("Scripting.FileSystemObject")
 stateFile = "$statePath"
-command = "cmd /c start /b cmd.exe /c claude --safe-mode --no-session-persistence --disable-slash-commands --effort low --model haiku -p hi"
+pingCommand = "claude --safe-mode --no-session-persistence --disable-slash-commands --effort low --model haiku -p hi"
+pingOutputFile = "$destDir\claude-ping-output.txt"
 
 KillOlderInstances()
 startTime = Now()
@@ -80,11 +81,60 @@ Sub CheckAndPing()
     End If
 
     If elapsedSeconds >= 18001 Then
+        Do While Not RunPing()
+            EnsureAuthenticated()
+        Loop
         Set f = objFSO.CreateTextFile(stateFile, True)
-        f.WriteLine CStr(nowTime)
+        f.WriteLine CStr(Now())
         f.Close
-        objShell.Run command, 0, False
     End If
+End Sub
+
+' Launches the ping the same way it's always been launched (start /b, hidden --
+' running it any other way has broken before) and captures its output to detect
+' an expired OAuth session. "start /b" hands off and returns almost instantly,
+' well before claude itself finishes, so waiting on the launched process is
+' useless for knowing when it's done; instead a marker is appended, inside that
+' same backgrounded cmd, right after claude exits, and we poll the output file
+' for it (bounded so a hang can't wedge this forever). Only True (success) lets
+' CheckAndPing write the state file, so a failed ping is retried on the next
+' minute's check instead of going silent for 5 hours.
+Function RunPing()
+    Dim launchCommand, doneMarker, pollStart, content, ts, isDone
+    doneMarker = "RUNNER_DONE_MARKER"
+
+    launchCommand = "cmd /c start /b cmd.exe /c """ & pingCommand & " > """ & pingOutputFile & """ 2>&1 & echo " & doneMarker & ">>""" & pingOutputFile & """"""
+    If objFSO.FileExists(pingOutputFile) Then objFSO.DeleteFile pingOutputFile, True
+    objShell.Run launchCommand, 0, False
+
+    isDone = False
+    content = ""
+    pollStart = Now()
+    Do While DateDiff("s", pollStart, Now()) < 60
+        If objFSO.FileExists(pingOutputFile) Then
+            Set ts = objFSO.OpenTextFile(pingOutputFile, 1)
+            content = ts.ReadAll()
+            ts.Close
+            If InStr(content, doneMarker) > 0 Then
+                isDone = True
+                Exit Do
+            End If
+        End If
+        WScript.Sleep(500)
+    Loop
+    If objFSO.FileExists(pingOutputFile) Then objFSO.DeleteFile pingOutputFile, True
+
+    ' A timeout (isDone still False) isn't treated as an auth failure -- that
+    ' would wrongly pop the sign-in window over what's more likely a network
+    ' hiccup -- so it's let through the same way an untracked failure always
+    ' was, and the state file still updates.
+    RunPing = (Not isDone) Or (InStr(1, content, "Failed to authenticate", 1) = 0)
+End Function
+
+' Opens a visible, interactive Claude session so the user can sign back in.
+' Blocks until that window is closed -- our signal to go retry the ping.
+Sub EnsureAuthenticated()
+    objShell.Run "cmd /c title Claude Runner 2049 - sign-in required & echo Your Claude Code session has expired. & echo Please sign in below, then close this window. & echo. & claude", 1, True
 End Sub
 "@ | Set-Content -Path $vbsPath -Encoding ASCII
 
