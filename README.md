@@ -334,6 +334,7 @@ Mesh is now set up **from the dashboard**, not during installation. Open the das
 
 - Every local write to `turns`/`tool_calls` also appends an immutable event to an append-only `oplog`, keyed by a **content hash** so applying the same event twice is a no-op.
 - Nodes gossip over plain HTTP using **pull-based anti-entropy**: a node compares per-origin event counts with each peer and fetches only the events it is missing. No broker and no third-party dependencies.
+- Every gossip round, each node also re-announces itself to every peer it knows (a heartbeat) and, once a peer has been unreachable for a few rounds, rescans the subnet that peer used to be on. Together these recover a peer whose address changed (e.g. a VM's NAT subnet was regenerated) as long as at least one side can still reach the other.
 - Because each Claude Code session runs on a single machine, `session_id` partitions writes by node, so merging is a conflict-free **union**. The rare case of the same turn re-logged is resolved last-writer-wins by timestamp.
 
 ### Enabling it (from the dashboard)

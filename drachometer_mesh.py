@@ -6,7 +6,10 @@ write to ``turns`` or ``tool_calls`` emits an immutable event into an ``oplog``
 table, keyed by a *content hash* so applying the same event any number of times
 is a no-op. Nodes gossip over plain stdlib HTTP using pull-based anti-entropy
 (compare per-origin digests, fetch the events you are missing): no broker, no
-third-party dependencies.
+third-party dependencies. Every round, each node also re-announces itself to
+every peer it knows (a heartbeat) and, once a peer has been unreachable for a
+few rounds, rescans the subnet it used to live on -- together these recover a
+peer whose address changed, whichever side can still reach the other.
 
 Scope is deliberately limited to LAN/VM networks. Most mesh endpoints require
 callers to present the mesh identifier (``<name>-<8 hex>``), which acts only
@@ -80,6 +83,8 @@ DISCOVERY_MAX_WORKERS = 128     # concurrent probes during a subnet scan
 DISCOVERY_MAX_HOSTS = 4096      # safety cap on total hosts scanned per request
 PROPAGATION_WINDOW = 15         # rolling window of records for mean propagation time
 PEER_ACTIVE_TTL = 45            # seconds a peer stays "active" after last successful contact
+PEER_FAIL_THRESHOLD = 3         # consecutive sync failures before a peer is "dark"
+REDISCOVERY_COOLDOWN_SECONDS = 300  # min gap between rediscovery scans for the same dark peer
 
 # Serializes oplog application *within* this process; WAL + busy_timeout handle
 # cross-process contention (the hook writes from a separate process).
@@ -114,6 +119,8 @@ _RUNTIME: dict = {
     "prop_seconds": deque(maxlen=PROPAGATION_WINDOW),  # recent propagation times
     "prop_recorded": set(),     # event_ids already counted toward propagation
     "last_scan": None,          # cached discover_meshes() result
+    "peer_fail_counts": {},     # peer -> consecutive sync failures
+    "peer_last_rediscovery": {},  # peer -> epoch of last rediscovery attempt
 }
 
 
@@ -391,12 +398,18 @@ def _load_pricing_overrides() -> None:
         tiers = data.get("tiers", data)
         if isinstance(tiers, dict):
             for tier, p in tiers.items():
-                if isinstance(p, dict) and isinstance(p.get("input"), (int, float)):
+                if (
+                    isinstance(p, dict)
+                    and all(
+                        isinstance(p.get(key), (int, float))
+                        for key in ("input", "output", "cache_read", "cache_create")
+                    )
+                ):
                     MODEL_TIER_PRICING[tier] = {
-                        "input": p.get("input"),
-                        "output": p.get("output"),
-                        "cache_read": p.get("cache_read"),
-                        "cache_create": p.get("cache_create"),
+                        "input": float(p["input"]),
+                        "output": float(p["output"]),
+                        "cache_read": float(p["cache_read"]),
+                        "cache_create": float(p["cache_create"]),
                     }
     except (OSError, json.JSONDecodeError, ValueError):
         pass
@@ -425,7 +438,7 @@ def _infer_model_attributes(model_key: str) -> dict:
     )
     version_match = re.search(r"(\d+(?:[-.]\d+)*(?:-\d{8})?)", model_key)
     provider = "Anthropic" if lower.startswith("claude") else None
-    pricing = MODEL_TIER_PRICING.get(tier, {})
+    pricing = MODEL_TIER_PRICING.get(tier or "", {})
     return {
         "model_name": model_name,
         "model_version": version_match.group(1) if version_match else None,
@@ -909,7 +922,7 @@ def _make_mesh_handler(cfg: dict, registry: _PeerRegistry, app_version: str,
             elif path == "/mesh/announce":
                 if not self._require_mesh_id(body.get("mesh_id")):
                     return
-                # Startup registration: a peer tells us how to reach it.
+                # Receiving end of the heartbeat in _announce().
                 advertise = body.get("advertise")
                 if advertise:
                     registry.add(advertise)
@@ -1096,9 +1109,12 @@ def sync_round(cfg: dict, registry: _PeerRegistry) -> int:
         for peer in registry.all():
             try:
                 total += sync_with_peer(cfg, peer)
+                with _RUNTIME_LOCK:
+                    _RUNTIME["peer_fail_counts"][peer] = 0
             except Exception as exc:  # network/peer errors are expected and non-fatal
                 ok = False
                 log(f"sync error {peer}: {exc}")
+                _note_peer_failure(cfg, registry, peer)
         try:
             _update_liveness_and_propagation(cfg, registry)
         except Exception as exc:  # liveness probing is best-effort
@@ -1111,7 +1127,58 @@ def sync_round(cfg: dict, registry: _PeerRegistry) -> int:
     return total
 
 
+def _note_peer_failure(cfg: dict, registry: _PeerRegistry, peer: str) -> None:
+    """Tracks consecutive sync failures for ``peer``; once it's been dark for
+    PEER_FAIL_THRESHOLD rounds, rescans the /24 it used to live on and adopts
+    anything answering for our mesh_id. Recovers from the peer's remembered
+    address going stale (e.g. a Hyper-V NAT switch regenerating its subnet)
+    without waiting on the peer to reach us first. REDISCOVERY_COOLDOWN_SECONDS
+    keeps a long-dead peer from being rescanned every round.
+    """
+    now = time.time()
+    with _RUNTIME_LOCK:
+        count = _RUNTIME["peer_fail_counts"].get(peer, 0) + 1
+        _RUNTIME["peer_fail_counts"][peer] = count
+        last_attempt = _RUNTIME["peer_last_rediscovery"].get(peer, 0)
+        due = count >= PEER_FAIL_THRESHOLD and (now - last_attempt) >= REDISCOVERY_COOLDOWN_SECONDS
+        if due:
+            _RUNTIME["peer_last_rediscovery"][peer] = now
+    if due:
+        _rediscover_peer(cfg, registry, peer)
+
+
+def _rediscover_peer(cfg: dict, registry: _PeerRegistry, peer: str) -> None:
+    """Rescans the /24 subnet a dark peer used to live on and adopts anything
+    that answers for our mesh_id, in case its address changed under it."""
+    host, _, port_str = peer.rpartition(":")
+    try:
+        subnet = str(ipaddress.ip_network(f"{host}/24", strict=False))
+        port = int(port_str)
+    except ValueError:
+        return
+    mesh_id = cfg.get("mesh_id")
+    try:
+        found = discover_meshes(port=port, subnets=[subnet])
+    except Exception as exc:
+        log(f"rediscovery scan error for {peer}: {exc}", level="warning")
+        return
+    known = set(registry.all())
+    for entry in found.get("meshes", []):
+        if entry.get("mesh_id") != mesh_id:
+            continue
+        for node in entry.get("nodes", []):
+            advertise = node.get("advertise")
+            if advertise and advertise not in known:
+                registry.add(advertise)
+                log(f"rediscovered peer {advertise} on {subnet} (was looking for {peer})")
+
+
 def _announce(cfg: dict, registry: _PeerRegistry) -> None:
+    """Heartbeat: called every gossip round to push our current address to every
+    peer we already know. We are the one initiating the connection, so this
+    recovers a peer that can no longer reach us (e.g. our address changed)
+    even though that peer's own outbound attempts to us keep failing --
+    its inability to reach us is irrelevant, since we're the one reaching it."""
     advertise = f"{cfg.get('advertise_host')}:{cfg.get('advertise_port', DEFAULT_PORT)}"
     for peer in registry.all():
         try:
@@ -1161,11 +1228,13 @@ def start_mesh(app_version: str = "", db_path: Path | None = None, inherited_soc
         _RUNTIME["active_peers"] = {}
         _RUNTIME["prop_seconds"] = deque(maxlen=PROPAGATION_WINDOW)
         _RUNTIME["prop_recorded"] = seed_prop_ids
+        _RUNTIME["peer_fail_counts"] = {}
+        _RUNTIME["peer_last_rediscovery"] = {}
 
     def _daemon():
-        _announce(cfg, registry)  # startup registration
         interval = int(cfg.get("sync_interval_seconds", DEFAULT_SYNC_INTERVAL))
         while not stop_event.is_set():
+            _announce(cfg, registry)  # heartbeat: re-registers us with every known peer
             sync_round(cfg, registry)
             stop_event.wait(interval)
 
@@ -1215,7 +1284,7 @@ def list_local_ipv4s() -> list[str]:
     try:
         for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
             addr = info[4][0]
-            if addr:
+            if isinstance(addr, str) and addr:
                 ips.add(addr)
     except OSError:
         pass
@@ -1502,6 +1571,8 @@ def _update_liveness_and_propagation(cfg: dict, registry: _PeerRegistry) -> None
     """
     node_id = cfg.get("node_id")
     mesh_id = cfg.get("mesh_id")
+    if not isinstance(mesh_id, str) or not mesh_id:
+        return
     now = time.time()
     active: dict[str, dict] = {}
     peer_has: dict[str, set[str]] = {}
@@ -1871,7 +1942,7 @@ def cmd_status(args) -> int:
     print(f"peers:     {len(peers)}")
     for peer in peers:
         try:
-            hello = _get_json(peer, _mesh_path("/mesh/hello", cfg.get("mesh_id")), timeout=3.0)
+            hello = _get_json(peer, _mesh_path("/mesh/hello", str(cfg.get("mesh_id") or "")), timeout=3.0)
             ok = "reachable" if hello.get("ok") else "MESH MISMATCH"
             print(f"             {peer}: {ok}")
         except Exception as exc:

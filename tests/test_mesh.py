@@ -801,6 +801,65 @@ class TestSubnetDiscovery(MeshTestBase):
         self.assertIsNone(mesh.probe_node("127.0.0.1", port, timeout=0.3))
 
 
+class TestPeerRediscovery(MeshTestBase):
+    def setUp(self):
+        super().setUp()
+        mesh._RUNTIME["peer_fail_counts"] = {}
+        mesh._RUNTIME["peer_last_rediscovery"] = {}
+
+    def test_note_peer_failure_triggers_rediscovery_at_threshold_then_cooldown(self):
+        calls = []
+        orig = mesh._rediscover_peer
+        mesh._rediscover_peer = lambda cfg, registry, peer: calls.append(peer)
+        self.addCleanup(setattr, mesh, "_rediscover_peer", orig)
+
+        cfg = {"mesh_id": "home-aaaa1111"}
+        registry = mesh._PeerRegistry(dict(cfg, peers=[]))
+        peer = "172.31.75.101:9874"
+
+        for _ in range(mesh.PEER_FAIL_THRESHOLD - 1):
+            mesh._note_peer_failure(cfg, registry, peer)
+        self.assertEqual(calls, [])  # not dark yet
+
+        mesh._note_peer_failure(cfg, registry, peer)
+        self.assertEqual(calls, [peer])  # crossed the threshold -> rediscovery fires
+
+        mesh._note_peer_failure(cfg, registry, peer)
+        self.assertEqual(calls, [peer])  # still within cooldown -> no second scan
+
+        mesh._RUNTIME["peer_last_rediscovery"][peer] -= mesh.REDISCOVERY_COOLDOWN_SECONDS + 1
+        mesh._note_peer_failure(cfg, registry, peer)
+        self.assertEqual(calls, [peer, peer])  # cooldown elapsed -> scans again
+
+    def test_rediscover_peer_adopts_matching_mesh_and_ignores_others(self):
+        seen_args = {}
+
+        def fake_discover_meshes(port=None, subnets=None, **kwargs):
+            seen_args["port"] = port
+            seen_args["subnets"] = subnets
+            return {"meshes": [
+                {"mesh_id": "home-aaaa1111", "nodes": [
+                    {"advertise": "172.31.75.55:9999", "node_id": "nodeB"},
+                ]},
+                {"mesh_id": "lab-bbbb2222", "nodes": [
+                    {"advertise": "172.31.75.66:9999", "node_id": "other"},
+                ]},
+            ]}
+
+        orig = mesh.discover_meshes
+        mesh.discover_meshes = fake_discover_meshes
+        self.addCleanup(setattr, mesh, "discover_meshes", orig)
+
+        cfg = {"mesh_id": "home-aaaa1111"}
+        registry = mesh._PeerRegistry(dict(cfg, peers=[]))
+        mesh._rediscover_peer(cfg, registry, "172.31.75.101:9999")
+
+        self.assertEqual(seen_args["port"], 9999)
+        self.assertEqual(seen_args["subnets"], ["172.31.75.0/24"])
+        self.assertIn("172.31.75.55:9999", registry.all())
+        self.assertNotIn("172.31.75.66:9999", registry.all())
+
+
 class TestPropagationTracking(MeshTestBase):
     def setUp(self):
         super().setUp()
