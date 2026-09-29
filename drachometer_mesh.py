@@ -1751,6 +1751,54 @@ def runtime_status() -> dict:
     }
 
 
+def _is_ipv4(value: str) -> bool:
+    try:
+        ipaddress.IPv4Address(value)
+        return True
+    except ValueError:
+        return False
+
+
+def _advertise_for_listen(host: str, current: str | None) -> str:
+    """Advertised address consistent with a listen (bind) address.
+
+    set_listen_host must keep the pair coherent: binding to one interface
+    makes any other advertised address unreachable, and even when binding to
+    all interfaces an advertise IP that is no longer assigned to any
+    interface is stale -- peers and the dashboard share string would keep
+    pointing at nothing. Configured hostnames are kept wherever they can
+    still make sense (they are a deliberate choice we cannot re-derive).
+    """
+    current = (current or "").strip()
+    if host == "127.0.0.1":
+        # Loopback-only listener: the loopback address is the only thing
+        # that can reach us (useful for same-host testing).
+        return "127.0.0.1"
+    if host not in (None, "", "0.0.0.0"):
+        # Bound to one specific interface: that address is exactly where
+        # peers can reach us. Keep a configured hostname only while it
+        # still resolves to this same interface.
+        if current and not _is_ipv4(current):
+            try:
+                resolved = {
+                    info[4][0]
+                    for info in socket.getaddrinfo(current, None, socket.AF_INET)
+                }
+            except OSError:
+                resolved = set()
+            if host in resolved:
+                return current
+        return host
+    # Listening on all interfaces: keep the current advertise address when
+    # it is a hostname, or an IP still assigned to some interface; replace
+    # a stale IP with the best current LAN address.
+    if current and (
+        not _is_ipv4(current) or current in {ip for ip, _ in list_local_interfaces()}
+    ):
+        return current
+    return detect_lan_ip()
+
+
 def set_listen_host(host: str | None) -> dict:
     """Persist the mesh listener bind address and restart the mesh server.
 
@@ -1758,6 +1806,11 @@ def set_listen_host(host: str | None) -> dict:
     on one of this machine's interfaces -- the dashboard's listen-interface
     selector offers exactly those choices, and everything else is rejected
     rather than written into the config to fail at next bind.
+
+    The advertised address is kept consistent with the new bind address: it
+    is the address peers are told to reach us on (and half of the share
+    string), so changing interfaces without updating it would advertise an
+    address that may no longer accept mesh connections.
     """
     cfg = load_config()
     if not cfg:
@@ -1767,12 +1820,25 @@ def set_listen_host(host: str | None) -> dict:
     }:
         return {"ok": False, "error": f"not a local interface address: {host}"}
     cfg["listen_host"] = host or "0.0.0.0"
+    previous_advertise = cfg.get("advertise_host")
+    cfg["advertise_host"] = _advertise_for_listen(cfg["listen_host"], previous_advertise)
     save_config(cfg)
-    log(f"listen host set to {cfg['listen_host']}")
+    log(f"listen host set to {cfg['listen_host']}; advertise host {cfg['advertise_host']}")
+    if cfg["advertise_host"] != previous_advertise:
+        log(
+            f"advertise host updated from {previous_advertise!r} to "
+            f"{cfg['advertise_host']!r} to match the new listen interface"
+        )
     started = False
     if cfg.get("enabled") and cfg.get("mesh_id") and cfg.get("node_id"):
         started = start_mesh(_current_app_version())
-    return {"ok": True, "listen_host": cfg["listen_host"], "started": started}
+    return {
+        "ok": True,
+        "listen_host": cfg["listen_host"],
+        "advertise_host": cfg["advertise_host"],
+        "advertise_changed": cfg["advertise_host"] != previous_advertise,
+        "started": started,
+    }
 
 
 # --------------------------------------------------------------------------- #

@@ -1446,14 +1446,91 @@
         agg._cost += costOf(r);
       }
 
+      // --- Repository root + full-name resolution -----------------------------
+      // The Repositories tab groups turns by repository root, not raw cwd, so
+      // work from a repo's subdirectories rolls up into the repo. Roots come
+      // from the server (git rev-parse --show-toplevel; only it can run git),
+      // with a client-side fallback for paths git cannot resolve -- e.g.
+      // replicated turns from another mesh node: the longest observed
+      // ancestor cwd in the database. The server also resolves each repo's
+      // full name (owner/repo from the origin remote) for the group-by-name
+      // preference, and reports which directories are not inside a git repo
+      // at all -- those are excluded from the Repositories tab.
+      const repoRoots = {}; // normPath(cwd) -> root | null (null: git found no repo)
+      const repoNames = {}; // normPath(cwd) -> "owner/name" | null (from origin remote)
+      const repoRootsPending = new Set();
+      let allCwdSet = new Set(); // every cwd in the DB, not just the date filter
+      let repoGroupByName = false; // preference: group repos by full name, not path
+
+      function longestObservedAncestor(cwd) {
+        let best = "";
+        allCwdSet.forEach((c) => {
+          if (c !== cwd && cwd.startsWith(c + "/") && c.length > best.length)
+            best = c;
+        });
+        return best;
+      }
+
+      function repoRootFor(cwd) {
+        const key = normPath(cwd);
+        if (!key) return "";
+        if (key in repoRoots) return repoRoots[key] || longestObservedAncestor(key) || key;
+        return longestObservedAncestor(key) || key;
+      }
+
+      async function refreshRepoRoots(cwds) {
+        const wanted = [...new Set(cwds)].filter(
+          (c) => c && !(c in repoRoots) && !repoRootsPending.has(c),
+        );
+        if (!wanted.length) return false;
+        wanted.forEach((c) => repoRootsPending.add(c));
+        try {
+          const resp = await fetch("/api/repo-roots", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ cwds: wanted }),
+          });
+          const data = await resp.json();
+          const roots = (data && data.roots) || {};
+          const names = (data && data.names) || {};
+          wanted.forEach((c) => {
+            repoRoots[c] = roots[c] ? normPath(roots[c]) : null;
+            repoNames[c] = names[c] || null;
+          });
+          // A first answer always changes the Repositories tab: resolved
+          // roots regroup rows, and confirmed non-repo cwds drop out of it.
+          return true;
+        } catch {
+          // Dashboard opened without the server (or the request failed):
+          // un-mark so a later reload can retry git resolution.
+          wanted.forEach((c) => repoRootsPending.delete(c));
+          return false;
+        }
+      }
+
       function computeRepoRows(turnRows) {
         const byRepo = {};
         turnRows.forEach((r) => {
-          const key = normPath(r.cwd);
-          const repoKey = key || "(no directory)";
+          const cwdKey = normPath(r.cwd);
+          // Records outside any git repo have no repository to roll up into,
+          // so they do not belong on the Repositories tab. This is only
+          // known once the server has answered: a dashboard opened without
+          // the server (repoRoots empty) still shows everything, grouped by
+          // raw path. Until then rows briefly render under their raw cwd and
+          // regroup (or vanish) when the resolution repaint lands.
+          if (!cwdKey || (cwdKey in repoRoots && !repoRoots[cwdKey])) return;
+          const root = repoRootFor(cwdKey);
+          const full = repoGroupByName ? repoNames[cwdKey] : null;
+          // Group by the origin's full name (owner/repo) when the preference
+          // asks for it and git reported one; repos without a resolvable
+          // origin keep grouping by their local root path.
+          const repoKey = full || root || "(no directory)";
           const g = (byRepo[repoKey] ||= {
             key: repoKey,
-            name: key ? key.split("/").filter(Boolean).pop() : "(no directory)",
+            name:
+              full || repoKey === "(no directory)"
+                ? repoKey
+                : repoKey.split("/").filter(Boolean).pop(),
             branches: {},
             ...blankAgg(),
           });
@@ -1860,6 +1937,22 @@
     LEFT JOIN models m ON m.id = t.model_id
     ${twt}`);
         const totalCost = allTurns.reduce((sum, r) => sum + costOf(r), 0);
+
+        // Repo grouping needs every cwd in the DB (not just the date filter)
+        // so repositories don't split apart as the slicer changes. Resolution
+        // is async: render now (heuristic grouping) and repaint when git
+        // answers for any newly-seen cwd.
+        allCwdSet = new Set(
+          query(
+            `SELECT DISTINCT cwd FROM turns WHERE cwd IS NOT NULL AND cwd <> ''`,
+          )
+            .map((r) => normPath(r.cwd))
+            .filter(Boolean),
+        );
+        refreshRepoRoots([...allCwdSet]).then((changed) => {
+          if (changed && activeTableTab === "repos") renderRepoTable();
+        });
+
         const costBySession = {};
         allTurns.forEach((r) => {
           costBySession[r.session_id] =
@@ -3258,6 +3351,16 @@
             <button class="mesh-btn" id="pref-save-btn">Save</button>
           </div>
           ${prefsUI.message ? `<p class="mesh-msg ${prefsUI.message.type}">${esc(prefsUI.message.text)}</p>` : ""}
+        </div>
+        <div class="mesh-section">
+          <h2>Repositories</h2>
+          <div class="mesh-row" style="align-items:center">
+            <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+              <input type="checkbox" id="pref-repo-by-name" ${repoGroupByName ? "checked" : ""} />
+              Group repositories by full name (owner/repo)
+            </label>
+          </div>
+          <p class="mesh-msg info">By default the Repositories tab groups turns by each repository's directory on disk. With this on, groups come from the repo's origin remote instead (e.g. <span class="mono">acme/widgets</span>), so two clones of the same repository merge into one row. Repositories without an origin remote keep grouping by path, and directories that are not inside a git repository are never listed.</p>
         </div>`;
         syncThemeModeButtons();
 
@@ -3315,12 +3418,44 @@
             } else {
               prefsUI.message = {
                 type: "info",
-                text: raw === "" ? "Retention cleared — everything is kept." : `Keeping ${raw} days of history.`,
+                text: raw === "" || Number(raw) === 0
+                  ? "Retention cleared — everything is kept."
+                  : `Keeping ${raw} days of history.`,
               };
             }
           } catch (err) {
             prefsUI.message = { type: "error", text: String(err) };
           }
+          prefsUI.prefs = await fetchPreferences();
+          renderPreferencesBody();
+        });
+
+        document.getElementById("pref-repo-by-name").addEventListener("change", async (e) => {
+          const value = e.target.checked;
+          try {
+            const resp = await fetch("/api/preferences", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ group_repos_by_name: value }),
+            });
+            const result = await resp.json();
+            if (result.ok === false) {
+              prefsUI.message = { type: "error", text: result.error || "Could not save." };
+              e.target.checked = !value;
+            } else {
+              repoGroupByName = value;
+              prefsUI.message = {
+                type: "info",
+                text: value
+                  ? "Repositories are now grouped by full name (owner/repo)."
+                  : "Repositories are now grouped by directory path.",
+              };
+            }
+          } catch (err) {
+            prefsUI.message = { type: "error", text: String(err) };
+            e.target.checked = !value;
+          }
+          if (activeTableTab === "repos") renderRepoTable();
           prefsUI.prefs = await fetchPreferences();
           renderPreferencesBody();
         });
@@ -3430,7 +3565,7 @@
 
         // Listen interface selector.
         html += `<div class="mesh-section"><h2>Listen interface</h2>
-          <p class="mesh-msg info">Which network interface accepts mesh connections. "All interfaces" (the default) accepts on every NIC; a specific address restricts the listener to that subnet. Changing this restarts the mesh listener.</p>`;
+          <p class="mesh-msg info">Which network interface accepts mesh connections. "All interfaces" (the default) accepts on every NIC; a specific address restricts the listener to that subnet. Changing this restarts the mesh listener and updates the advertised address (the one peers and the share string use) to match, so it never points at an interface that no longer accepts connections.</p>`;
         const ifs = meshUI.interfaces;
         if (ifs && ifs.available !== false) {
           const current = ifs.listen_host || "0.0.0.0";
@@ -3656,6 +3791,14 @@
 
       // --- Init ---
       restoreSlicer();
+      // The Repositories tab's group-by-name preference lives server-side;
+      // fetch it once and repaint if it changes how the tab groups.
+      fetchPreferences().then((p) => {
+        if (p && typeof p.group_repos_by_name === "boolean" && p.group_repos_by_name !== repoGroupByName) {
+          repoGroupByName = p.group_repos_by_name;
+          if (activeTableTab === "repos") renderRepoTable();
+        }
+      });
       checkForUpdates();
       initMesh();
 

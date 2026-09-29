@@ -1085,6 +1085,103 @@ class TestRuntimeControl(MeshTestBase):
         self.assertIsNone(mesh.mesh_uptime_seconds())
 
 
+class TestSetListenHost(MeshTestBase):
+    """Changing the listen interface must keep the advertised address coherent:
+    advertise_host is what peers are told to reach us on (and half of the
+    dashboard share string)."""
+
+    # TEST-NET addresses can never be assigned to a real interface, so they
+    # simulate a stale advertise from a network this machine left.
+    STALE = "203.0.113.9"
+
+    def _config(self, advertise_host, listen_host="0.0.0.0"):
+        # enabled=False so set_listen_host does not spawn a live mesh server;
+        # the address bookkeeping under test happens before that anyway.
+        mesh.save_config(mesh.normalize_config({
+            "enabled": False,
+            "mesh_id": "selftest-abcd1234",
+            "node_id": "node-x",
+            "listen_host": listen_host,
+            "listen_port": 9974,
+            "advertise_host": advertise_host,
+            "advertise_port": 9974,
+            "peers": [],
+        }))
+
+    def _local_ip(self):
+        ips = [ip for ip, _ in mesh.list_local_interfaces() if ip != "127.0.0.1"]
+        if not ips:
+            self.skipTest("no non-loopback local interface detected")
+        return ips[0]
+
+    def test_binding_specific_interface_updates_advertise(self):
+        ip = self._local_ip()
+        self._config(self.STALE)
+        result = mesh.set_listen_host(ip)
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["advertise_changed"])
+        self.assertEqual(result["advertise_host"], ip)
+        self.assertEqual(mesh.load_config()["advertise_host"], ip)
+
+    def test_binding_loopback_advertises_loopback(self):
+        self._config("192.168.1.10")
+        result = mesh.set_listen_host("127.0.0.1")
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["advertise_host"], "127.0.0.1")
+        self.assertEqual(mesh.load_config()["advertise_host"], "127.0.0.1")
+
+    def test_all_interfaces_keeps_advertise_that_is_still_configured(self):
+        ip = self._local_ip()
+        self._config(ip)
+        result = mesh.set_listen_host("0.0.0.0")
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["advertise_changed"])
+        self.assertEqual(result["advertise_host"], ip)
+
+    def test_all_interfaces_replaces_stale_advertise_ip(self):
+        self._config(self.STALE)
+        self.addCleanup(setattr, mesh, "detect_lan_ip", mesh.detect_lan_ip)
+        mesh.detect_lan_ip = lambda: "192.0.2.77"
+        result = mesh.set_listen_host("0.0.0.0")
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["advertise_changed"])
+        self.assertEqual(result["advertise_host"], "192.0.2.77")
+
+    def test_hostname_advertise_survives_all_interfaces_binding(self):
+        # A hostname is a deliberate choice we cannot re-derive; on 0.0.0.0
+        # any of this machine's addresses can answer for it.
+        self._config("mybox.example.com")
+        result = mesh.set_listen_host("0.0.0.0")
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["advertise_changed"])
+        self.assertEqual(result["advertise_host"], "mybox.example.com")
+
+    def test_hostname_advertise_replaced_when_interface_cannot_answer(self):
+        # Bound to one interface, a hostname that does not resolve to it is
+        # unreachable; the interface IP takes over.
+        ip = self._local_ip()
+        self._config("mybox.example.com")
+        real_getaddrinfo = mesh.socket.getaddrinfo
+
+        def _no_resolution(*args, **kwargs):
+            return []
+
+        mesh.socket.getaddrinfo = _no_resolution
+        self.addCleanup(setattr, mesh.socket, "getaddrinfo", real_getaddrinfo)
+        result = mesh.set_listen_host(ip)
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["advertise_changed"])
+        self.assertEqual(result["advertise_host"], ip)
+
+    def test_invalid_host_still_rejected_and_config_untouched(self):
+        self._config(self.STALE)
+        result = mesh.set_listen_host("203.0.113.99")
+        self.assertFalse(result["ok"])
+        cfg = mesh.load_config()
+        self.assertEqual(cfg["listen_host"], "0.0.0.0")
+        self.assertEqual(cfg["advertise_host"], self.STALE)
+
+
 class TestSelfTest(MeshTestBase):
     """The mesh self-test simulation must pass inside the test suite too."""
 

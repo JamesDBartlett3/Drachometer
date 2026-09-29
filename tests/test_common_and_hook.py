@@ -12,6 +12,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -203,9 +204,61 @@ class ParseRetentionDaysTest(unittest.TestCase):
     def test_valid_values(self):
         self.assertIsNone(hook.parse_retention_days(None))
         self.assertEqual(hook.parse_retention_days("30"), 30)
-        self.assertEqual(hook.parse_retention_days(0), 0)
+        self.assertEqual(hook.parse_retention_days(7), 7)
         self.assertIsNone(hook.parse_retention_days("-1"))
         self.assertIsNone(hook.parse_retention_days("nope"))
+
+    def test_zero_means_keep_everything_not_delete_everything(self):
+        # Regression: 0 used to parse as a 0-day window, whose cutoff is
+        # "now" -- purging every existing record on the next hook run.
+        # 0 must disable retention, matching the mesh's compact_oplog.
+        for zero in (0, "0", " 0 "):
+            self.assertIsNone(hook.parse_retention_days(zero))
+
+
+class PurgeOldRecordsTest(unittest.TestCase):
+    def _seeded_conn(self):
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(common.BASE_SCHEMA_DDL)
+        now = datetime.now(timezone.utc)
+        old = (now - timedelta(days=40)).isoformat()
+        recent = (now - timedelta(days=1)).isoformat()
+        for i, recorded in enumerate((old, recent)):
+            conn.execute(
+                """INSERT INTO turns (session_id, turn_id, recorded_at, input_tokens, output_tokens)
+                   VALUES (?, ?, ?, 10, 5)""",
+                (f"s-{i}", "turn-1", recorded),
+            )
+        conn.execute(
+            "INSERT INTO tool_calls (session_id, turn_id, recorded_at, tool_name)"
+            " VALUES ('s-0', 'turn-1', ?, 'Bash')",
+            (old,),
+        )
+        conn.commit()
+        return conn
+
+    def test_positive_window_deletes_only_rows_older_than_cutoff(self):
+        conn = self._seeded_conn()
+        try:
+            hook.purge_old_records(conn, 30)
+            self.assertEqual(
+                [r[0] for r in conn.execute("SELECT session_id FROM turns")],
+                ["s-1"],
+            )
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM tool_calls").fetchone()[0], 0)
+        finally:
+            conn.close()
+
+    def test_zero_and_negative_windows_delete_nothing(self):
+        for days in (0, -3):
+            with self.subTest(days=days):
+                conn = self._seeded_conn()
+                try:
+                    hook.purge_old_records(conn, days)
+                    self.assertEqual(conn.execute("SELECT COUNT(*) FROM turns").fetchone()[0], 2)
+                    self.assertEqual(conn.execute("SELECT COUNT(*) FROM tool_calls").fetchone()[0], 1)
+                finally:
+                    conn.close()
 
 
 if __name__ == "__main__":

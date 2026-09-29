@@ -11,13 +11,17 @@ prior running instance before it overwrites files.
 import ipaddress
 import json
 import os
+import re
 import sqlite3
+import subprocess
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from socketserver import ThreadingMixIn
 from pathlib import Path
+from urllib.parse import urlparse
 
 PORT = 9873
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -31,6 +35,124 @@ try:
     import drachometer_mesh as mesh
 except Exception:
     mesh = None
+
+
+# -- repository root + full-name resolution (for the Repositories tab) ------- #
+# The dashboard groups usage by repository root rather than raw cwd, so a
+# repo's subdirectories roll up into the repo. Only the server can ask git
+# (the dashboard is a browser page), so it exposes /api/repo-roots. Results
+# are cached for the life of the process: a directory's repo root essentially
+# never changes, and re-running git on every reload would be wasteful.
+_repo_root_cache: dict[str, str | None] = {}
+_repo_root_lock = threading.Lock()
+
+
+def _resolve_repo_root(cwd: str) -> str | None:
+    """Return the git repository containing ``cwd``, or None if it is not
+    inside one (including nonexistent paths, e.g. directories on other mesh
+    nodes -- the dashboard falls back to its own grouping for those)."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", cwd, "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, timeout=5,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return None
+    if proc.returncode != 0:
+        return None
+    return proc.stdout.strip() or None
+
+
+def _resolve_repo_roots(cwds: list) -> dict:
+    roots: dict[str, str | None] = {}
+    uncached: list[str] = []
+    with _repo_root_lock:
+        for cwd in cwds:
+            if cwd in _repo_root_cache:
+                roots[cwd] = _repo_root_cache[cwd]
+            else:
+                uncached.append(cwd)
+    if uncached:
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            resolved = dict(zip(uncached, pool.map(_resolve_repo_root, uncached)))
+        with _repo_root_lock:
+            _repo_root_cache.update(resolved)
+        roots.update(resolved)
+    return roots
+
+
+# Full names (owner/repo, from the origin remote) resolve per repo *root*, so
+# every cwd inside the same repo shares one cached answer.
+_repo_name_cache: dict[str, str | None] = {}
+_repo_name_lock = threading.Lock()
+
+
+def _repo_full_name_from_url(url: str | None) -> str | None:
+    """Extract ``owner/name`` from a git remote URL (https, ssh, or the
+    scp-like ``git@host:owner/name.git`` form). Returns None for anything that
+    does not look like a hosted owner/name repository (local paths, bare
+    hosts, file remotes)."""
+    if not url:
+        return None
+    url = url.strip()
+    scp = re.match(r"^[^/@:]+@[^:/]+:(?P<path>.+?)/?$", url)
+    if scp:
+        path = scp.group("path")
+    elif "://" in url:
+        try:
+            parsed = urlparse(url)
+        except ValueError:
+            return None
+        if parsed.scheme == "file":  # a local mirror, not a hosted repo
+            return None
+        path = parsed.path
+    else:
+        return None
+    segments = [seg for seg in path.split("/") if seg]
+    if len(segments) < 2:
+        return None
+    repo = segments[-1]
+    if repo.endswith(".git"):
+        repo = repo[: -len(".git")]
+    if not repo:
+        return None
+    # Hosted git servers may nest (GitLab subgroups); the last two segments
+    # are always the owning namespace and the repository itself.
+    return f"{segments[-2]}/{repo}"
+
+
+def _resolve_repo_name(root: str) -> str | None:
+    """The repository's full name (e.g. ``owner/name``) from its origin
+    remote, or None when the repo has no origin or its URL does not name a
+    hosted repository."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", root, "remote", "get-url", "origin"],
+            capture_output=True, text=True, timeout=5,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return None
+    if proc.returncode != 0:
+        return None
+    return _repo_full_name_from_url(proc.stdout)
+
+
+def _resolve_repo_names(roots_by_cwd: dict) -> dict:
+    """Full names for the given cwd->root mapping, keyed by cwd like
+    ``_resolve_repo_roots``' result. cwd entries without a root get None."""
+    with _repo_name_lock:
+        needed = [r for r in set(roots_by_cwd.values()) if r and r not in _repo_name_cache]
+    if needed:
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            resolved = dict(zip(needed, pool.map(_resolve_repo_name, needed)))
+        with _repo_name_lock:
+            _repo_name_cache.update(resolved)
+    return {
+        cwd: _repo_name_cache.get(root) if root else None
+        for cwd, root in roots_by_cwd.items()
+    }
 
 
 def _app_version() -> str:
@@ -122,20 +244,34 @@ class Handler(SimpleHTTPRequestHandler):
             settings = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError, ValueError):
             settings = {}
-        value = settings.get("token_usage_retention_days") if isinstance(settings, dict) else None
-        return {"token_usage_retention_days": value}
+        if not isinstance(settings, dict):
+            settings = {}
+        retention = settings.get("token_usage_retention_days")
+        by_name = bool(settings.get("group_repos_by_name"))
+        return {"token_usage_retention_days": retention, "group_repos_by_name": by_name}
 
     def _write_preferences(self, body: dict) -> dict:
-        value = body.get("token_usage_retention_days")
-        if value is None or value == "":
-            days = None  # empty clears the preference (keep everything)
-        else:
-            try:
-                days = int(str(value).strip())
-            except (TypeError, ValueError):
-                return {"ok": False, "error": "retention must be a non-negative number of days"}
-            if days < 0:
-                return {"ok": False, "error": "retention must be a non-negative number of days"}
+        # Merge-style: only keys present in the body change, so saving the
+        # repo-grouping toggle does not clobber retention (and vice versa).
+        updates: dict = {}
+        if "token_usage_retention_days" in body:
+            value = body.get("token_usage_retention_days")
+            if value is None or value == "":
+                days = None  # empty clears the preference (keep everything)
+            else:
+                try:
+                    days = int(str(value).strip())
+                except (TypeError, ValueError):
+                    return {"ok": False, "error": "retention must be a non-negative number of days"}
+                if days < 0:
+                    return {"ok": False, "error": "retention must be a non-negative number of days"}
+                if days == 0:
+                    # 0 means "keep everything" (a 0-day cutoff would purge all
+                    # records), so store it the same as cleared.
+                    days = None
+            updates["token_usage_retention_days"] = days
+        if "group_repos_by_name" in body:
+            updates["group_repos_by_name"] = bool(body.get("group_repos_by_name"))
         try:
             if SETTINGS_PATH.exists():
                 settings = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
@@ -143,16 +279,17 @@ class Handler(SimpleHTTPRequestHandler):
                 settings = {}
             if not isinstance(settings, dict):
                 settings = {}
-            if days is None:
-                settings.pop("token_usage_retention_days", None)
-            else:
-                settings["token_usage_retention_days"] = days
+            for key, value in updates.items():
+                if value is None:
+                    settings.pop(key, None)
+                else:
+                    settings[key] = value
             SETTINGS_PATH.write_text(
                 json.dumps(settings, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
             )
         except OSError as exc:
             return {"ok": False, "error": str(exc)}
-        return {"ok": True, "token_usage_retention_days": days}
+        return {"ok": True, **updates}
 
     # -- routing ------------------------------------------------------------ #
     def do_GET(self):
@@ -272,6 +409,16 @@ class Handler(SimpleHTTPRequestHandler):
                 self._send_json({"ok": False, "error": str(exc)}, status=500)
                 return
             self._send_json({"ok": False, "error": "unknown endpoint"}, status=404)
+            return
+
+        if path == "/api/repo-roots":
+            cwds = self._read_json_body().get("cwds")
+            if not isinstance(cwds, list):
+                self._send_json({"ok": False, "error": "cwds must be a list"}, status=400)
+                return
+            valid = [c for c in cwds if isinstance(c, str) and c][:500]
+            roots = _resolve_repo_roots(valid)
+            self._send_json({"ok": True, "roots": roots, "names": _resolve_repo_names(roots)})
             return
 
         if path == "/api/preferences":

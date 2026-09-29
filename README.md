@@ -81,7 +81,7 @@ That's it. Usage is logged automatically from that point on.
 
 Displayed in a tabbed interface (Repositories / Folders / Sessions / Recent Turns); the active tab persists across reloads.
 
-- **Repositories** — token usage and cost rolled up to the repository level; expand a repo to see the same stats per git branch
+- **Repositories** — token usage and cost rolled up to the repository level; expand a repo to see the same stats per git branch. Turns are grouped by repository root (resolved via git), so work done in a repo's subdirectories rolls up into that repo instead of appearing as separate entries. Directories outside any git repository are not listed. Optionally, Preferences can group repositories by their full name (`owner/repo`, taken from each repo's origin remote), so clones of the same repository in different locations merge into one row
 - **Folders** — the directory hierarchy as an expandable tree with usage rolled up at every level; root-level folders start expanded one level
 - **Sessions** — cost, tokens, model, directory, and branch per session
 - **Recent Turns** — last 50 turns with full token breakdown
@@ -93,10 +93,10 @@ Displayed in a tabbed interface (Repositories / Folders / Sessions / Recent Turn
 - **Multi-sort tables** — click any column header to sort; Ctrl+click to add secondary/tertiary sort columns (▲/▼ indicators with subscript priority)
 - **Rich chart tooltips** — hover over any chart element to see cost and full token breakdown (uncached input, output, cache read, cache create)
 - **Live refresh** — the dashboard auto-updates via SSE when the database changes (no manual reload needed); re-renders are debounced to at most one per 5-second window so active sessions don't make the visuals twitch
-- **Settings modal** — the hamburger menu opens a two-tab settings modal (Preferences with theme + usage-history retention; Mesh Network for all mesh configuration); the "peers connected" pill opens the same modal on the Mesh tab
+- **Settings modal** — the hamburger menu opens a two-tab settings modal (Preferences with theme, usage-history retention, and repository grouping; Mesh Network for all mesh configuration); the "peers connected" pill opens the same modal on the Mesh tab
 - **Theme** — dark/light mode toggle in Preferences, plus a field to paste a [tweakcn](https://tweakcn.com/themes/community) theme link (or slug) for any community theme. A theme recolors the app around its primary color and overrides the Dark/Light toggle; chart colors are assigned in each visual's axis order (most-used tool, alphabetical model tiers, the waterfall's category order) starting with the primary, with the remaining datapoints colored by color-theory harmonies of it
 - **Mesh share string** — one-click copy of `<mesh-id> <lan-ip>:<port>`, which a peer can paste into their single "Join by mesh id" box (accepting the id, the address, or both)
-- **Listen interface selector** — choose which network interface/subnet the mesh listener binds to (all interfaces, loopback, or a detected NIC); changing it restarts the listener
+- **Listen interface selector** — choose which network interface/subnet the mesh listener binds to (all interfaces, loopback, or a detected NIC); changing it restarts the listener and keeps the advertised address (what peers and the share string use) consistent with the new interface
 - **Release update notice** — the dashboard checks GitHub Releases and shows a banner when a newer semver release is available
 - **Info tooltips** — hover over any card's info icon for an explanation of how to read that visual
 - **Local timezone** — all dates and times display in your browser's timezone
@@ -323,7 +323,7 @@ You can automatically purge old records by setting a retention window (in days):
 - Add `"token_usage_retention_days": 30` to `~/.claude/settings.json`, or
 - Set `TOKEN_USAGE_RETENTION_DAYS=30` in the environment where Claude Code runs.
 
-When configured, the hook deletes `turns` and `tool_calls` rows older than the retention window each time it runs.
+When configured, the hook deletes `turns` and `tool_calls` rows older than the retention window each time it runs. Leave the setting empty (or set it to `0`) to keep everything — a retention value of `0` is treated as disabled, never as a zero-day window (which would delete all existing records), matching the mesh oplog retention's `0 = disabled` convention.
 
 ## Mesh Replication (LAN/VM)
 
@@ -352,7 +352,7 @@ Open the dashboard, click the **hamburger menu (☰)** to the left of the logo (
 - **Scans all local subnets on every enabled NIC** for other Drachometer nodes. Nodes running *your* mesh are matched by id; nodes on other (or no) meshes are listed by address only — **a scan never reveals another mesh's id**, since the id is the only gate on every mesh endpoint.
 - **Join an existing mesh:** paste the mesh share string (`<mesh-id> <lan-ip>:<port>`) into the "Join by mesh id" box — the id, the address, or both, in one paste. Ask the mesh owner for theirs; it's one click to copy on their side. This shared secret keeps unrelated meshes on the same LAN from accidentally merging.
 - **Create a new mesh:** give it a name and a new mesh id like `home-a1b2c3d4` is generated.
-- **Listen interface:** choose which NIC/subnet accepts mesh connections (all interfaces, loopback only, or a detected address); applying a change restarts the listener.
+- **Listen interface:** choose which NIC/subnet accepts mesh connections (all interfaces, loopback only, or a detected address); applying a change restarts the listener and updates the advertised address to match.
 - **Leave:** stop replicating. History is preserved and your node identity is kept for re-joining later.
 
 Only **one mesh can be joined at a time** — joining or creating a mesh automatically leaves the current one, even if it has no active peers.

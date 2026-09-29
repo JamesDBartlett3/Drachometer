@@ -74,13 +74,21 @@ def ensure_dashboard_server() -> None:
 
 
 def parse_retention_days(value: object) -> int | None:
+    """Parse a retention window in days; None disables purging entirely.
+
+    0 is treated as disabled, never as a 0-day window: a 0-day cutoff is
+    "everything recorded before now", which would wipe the whole history on
+    the next hook run. The dashboard's retention field documents 0 as "keep
+    everything", and the mesh's compact_oplog treats retention_days <= 0 as
+    disabled -- this keeps all three consistent.
+    """
     if value is None:
         return None
     try:
         days = int(str(value).strip())
     except (TypeError, ValueError):
         return None
-    return days if days >= 0 else None
+    return days if days > 0 else None
 
 
 def get_retention_days() -> int | None:
@@ -97,6 +105,10 @@ def get_retention_days() -> int | None:
 
 
 def purge_old_records(conn: sqlite3.Connection, retention_days: int) -> None:
+    if retention_days <= 0:
+        # Guard, not just parse: a 0-day cutoff is "everything recorded
+        # before now", i.e. delete all records. 0 means keep everything.
+        return
     cutoff = (datetime.now(timezone.utc) - timedelta(days=retention_days)).isoformat()
     conn.execute("DELETE FROM tool_calls WHERE recorded_at < ?", (cutoff,))
     conn.execute("DELETE FROM turns WHERE recorded_at < ?", (cutoff,))
