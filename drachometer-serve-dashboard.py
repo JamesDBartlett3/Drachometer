@@ -8,6 +8,7 @@ join, leave, live status) and let the installer detect and gracefully stop a
 prior running instance before it overwrites files.
 """
 
+import ipaddress
 import json
 import os
 import sqlite3
@@ -21,6 +22,7 @@ from pathlib import Path
 PORT = 9873
 SCRIPT_DIR = Path(__file__).resolve().parent
 DB_PATH = Path.home() / ".claude" / "drachometer.db"
+SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
 PID_PATH = Path.home() / ".claude" / "drachometer-dashboard.pid"
 
 # Optional mesh replication; absence leaves the loopback dashboard server unchanged.
@@ -112,6 +114,46 @@ class Handler(SimpleHTTPRequestHandler):
         except (json.JSONDecodeError, ValueError):
             return {}
 
+    # -- user preferences (stored in ~/.claude/settings.json) --------------- #
+    # The retention key lives at the top level of settings.json because that is
+    # where the hook already looks for it (token_usage_retention_days).
+    def _read_preferences(self) -> dict:
+        try:
+            settings = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, ValueError):
+            settings = {}
+        value = settings.get("token_usage_retention_days") if isinstance(settings, dict) else None
+        return {"token_usage_retention_days": value}
+
+    def _write_preferences(self, body: dict) -> dict:
+        value = body.get("token_usage_retention_days")
+        if value is None or value == "":
+            days = None  # empty clears the preference (keep everything)
+        else:
+            try:
+                days = int(str(value).strip())
+            except (TypeError, ValueError):
+                return {"ok": False, "error": "retention must be a non-negative number of days"}
+            if days < 0:
+                return {"ok": False, "error": "retention must be a non-negative number of days"}
+        try:
+            if SETTINGS_PATH.exists():
+                settings = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+            else:
+                settings = {}
+            if not isinstance(settings, dict):
+                settings = {}
+            if days is None:
+                settings.pop("token_usage_retention_days", None)
+            else:
+                settings["token_usage_retention_days"] = days
+            SETTINGS_PATH.write_text(
+                json.dumps(settings, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+            )
+        except OSError as exc:
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True, "token_usage_retention_days": days}
+
     # -- routing ------------------------------------------------------------ #
     def do_GET(self):
         path = self.path.split("?")[0]
@@ -151,6 +193,33 @@ class Handler(SimpleHTTPRequestHandler):
                 self._send_json(mesh.discover_meshes())
             except Exception as exc:  # scanning is best-effort
                 self._send_json({"available": True, "error": str(exc), "meshes": []})
+            return
+
+        if path == "/mesh/api/interfaces":
+            # Detected NICs/subnets plus the current listener binding, for the
+            # dashboard's listen-interface selector.
+            if not mesh:
+                self._send_json({"available": False}, status=200)
+                return
+            try:
+                cfg = mesh.load_config() or {}
+                interfaces = [
+                    {"ip": ip, "prefix": prefix,
+                     "subnet": str(ipaddress.ip_network(f"{ip}/{prefix}", strict=False))}
+                    for ip, prefix in mesh.list_local_interfaces()
+                ]
+                self._send_json({
+                    "available": True,
+                    "interfaces": interfaces,
+                    "listen_host": cfg.get("listen_host", "0.0.0.0"),
+                    "listen_port": int(cfg.get("listen_port", mesh.DEFAULT_PORT)),
+                })
+            except Exception as exc:
+                self._send_json({"available": True, "error": str(exc), "interfaces": []})
+            return
+
+        if path == "/api/preferences":
+            self._send_json(self._read_preferences())
             return
 
         super().do_GET()
@@ -196,10 +265,17 @@ class Handler(SimpleHTTPRequestHandler):
                 if path == "/mesh/api/leave":
                     self._send_json({"ok": True, **mesh.leave_mesh()})
                     return
+                if path == "/mesh/api/listen":
+                    self._send_json(mesh.set_listen_host(body.get("listen_host")))
+                    return
             except Exception as exc:
                 self._send_json({"ok": False, "error": str(exc)}, status=500)
                 return
             self._send_json({"ok": False, "error": "unknown endpoint"}, status=404)
+            return
+
+        if path == "/api/preferences":
+            self._send_json(self._write_preferences(self._read_json_body()))
             return
 
         self.send_error(404, "Not found")

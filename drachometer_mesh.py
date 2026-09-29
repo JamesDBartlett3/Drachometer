@@ -15,9 +15,10 @@ Scope is deliberately limited to LAN/VM networks. Most mesh endpoints require
 callers to present the mesh identifier (``<name>-<8 hex>``), which acts only
 as a lightweight shared-secret gate to prevent accidental or casual
 cross-mesh merges on a shared LAN (coworkers, roommates). Discovery keeps one
-anonymous, read-only probe so nodes can advertise which mesh they belong to.
-This is **not** robust authentication and there is still no TLS, so do not
-expose mesh ports to the public internet.
+anonymous, read-only probe that answers yes/no for a *presented* mesh id but
+never reveals which mesh a node belongs to, so a stranger scanning the LAN
+cannot harvest mesh ids. This is **not** robust authentication and there is
+still no TLS, so do not expose mesh ports to the public internet.
 
 This file is both an importable library (the hook and the dashboard server import
 it) and a CLI for setup and maintenance::
@@ -26,6 +27,7 @@ it) and a CLI for setup and maintenance::
     python drachometer_mesh.py join  MESH_ID --peer HOST:PORT [--peer HOST:PORT ...]
     python drachometer_mesh.py import OTHER.db [--as LABEL]
     python drachometer_mesh.py status
+    python drachometer_mesh.py self-test [--json]
     python drachometer_mesh.py disable
 
 Because identity is content-addressed and each Claude Code session runs on a
@@ -48,8 +50,10 @@ import socket
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
@@ -60,6 +64,14 @@ from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from socketserver import ThreadingMixIn
+
+# Shared pricing/model inference/schema helpers (same install directory).
+import drachometer_common as common
+from drachometer_common import (  # noqa: F401  (re-exported for hook/installer/tests)
+    MODEL_TIER_PRICING,
+    ensure_model_row,
+    infer_model_attributes,
+)
 
 CLAUDE_DIR = Path.home() / ".claude"
 DB_PATH = CLAUDE_DIR / "drachometer.db"
@@ -93,6 +105,7 @@ _METRICS_LOCK = threading.Lock()
 _METRICS = {
     "dedupes": 0,
     "conflicts": 0,
+    "rejected": 0,
     "failed_sync_attempts": 0,
     "last_sync_at": None,
     "last_sync_peer": None,
@@ -323,6 +336,7 @@ def reset_metrics() -> None:
         _METRICS.update({
             "dedupes": 0,
             "conflicts": 0,
+            "rejected": 0,
             "failed_sync_attempts": 0,
             "last_sync_at": None,
             "last_sync_peer": None,
@@ -381,96 +395,9 @@ def collect_health_metrics(cfg: dict | None = None, db_path: Path | None = None)
 
 
 # --------------------------------------------------------------------------- #
-# Model dimension (kept self-contained; mirrors the hook/installer inference so
-# replicated model_keys resolve to priced rows on every node).
+# Model dimension: inference, pricing, and row creation live in
+# drachometer_common so the hook, installer, and mesh can never drift apart.
 # --------------------------------------------------------------------------- #
-MODEL_TIER_PRICING = {
-    "opus":   {"input": 5.0, "output": 25.0, "cache_read": 0.50, "cache_create": 6.25},
-    "sonnet": {"input": 3.0, "output": 15.0, "cache_read": 0.30, "cache_create": 3.75},
-    "haiku":  {"input": 1.0, "output": 5.0,  "cache_read": 0.10, "cache_create": 1.25},
-}
-
-
-def _load_pricing_overrides() -> None:
-    pricing_path = Path(__file__).resolve().parent / "drachometer-pricing.json"
-    try:
-        data = json.loads(pricing_path.read_text(encoding="utf-8"))
-        tiers = data.get("tiers", data)
-        if isinstance(tiers, dict):
-            for tier, p in tiers.items():
-                if (
-                    isinstance(p, dict)
-                    and all(
-                        isinstance(p.get(key), (int, float))
-                        for key in ("input", "output", "cache_read", "cache_create")
-                    )
-                ):
-                    MODEL_TIER_PRICING[tier] = {
-                        "input": float(p["input"]),
-                        "output": float(p["output"]),
-                        "cache_read": float(p["cache_read"]),
-                        "cache_create": float(p["cache_create"]),
-                    }
-    except (OSError, json.JSONDecodeError, ValueError):
-        pass
-
-
-_load_pricing_overrides()
-
-
-def _infer_model_attributes(model_key: str) -> dict:
-    lower = model_key.lower()
-    if "fable" in lower:
-        tier = "fable"
-    elif "opus" in lower:
-        tier = "opus"
-    elif "sonnet" in lower:
-        tier = "sonnet"
-    elif "haiku" in lower:
-        tier = "haiku"
-    else:
-        tier = None
-    parts = [p for p in model_key.split("-") if p]
-    model_name = (
-        " ".join(parts[:2]).title()
-        if len(parts) >= 2 and parts[0].lower() == "claude"
-        else (parts[0].title() if parts else None)
-    )
-    version_match = re.search(r"(\d+(?:[-.]\d+)*(?:-\d{8})?)", model_key)
-    provider = "Anthropic" if lower.startswith("claude") else None
-    pricing = MODEL_TIER_PRICING.get(tier or "", {})
-    return {
-        "model_name": model_name,
-        "model_version": version_match.group(1) if version_match else None,
-        "model_provider": provider,
-        "input_price_per_mtok": pricing.get("input"),
-        "output_price_per_mtok": pricing.get("output"),
-        "cache_read_price_per_mtok": pricing.get("cache_read"),
-        "cache_creation_price_per_mtok": pricing.get("cache_create"),
-    }
-
-
-def ensure_model_row(conn: sqlite3.Connection, model_key: str | None) -> int | None:
-    key = (model_key or "").strip()
-    if not key:
-        return None
-    row = conn.execute("SELECT id FROM models WHERE model_key = ?", (key,)).fetchone()
-    if row:
-        return row[0]
-    attrs = _infer_model_attributes(key)
-    cur = conn.execute(
-        """INSERT INTO models (
-               model_key, model_name, model_version, model_provider,
-               input_price_per_mtok, output_price_per_mtok,
-               cache_read_price_per_mtok, cache_creation_price_per_mtok
-           ) VALUES (
-               :model_key, :model_name, :model_version, :model_provider,
-               :input_price_per_mtok, :output_price_per_mtok,
-               :cache_read_price_per_mtok, :cache_creation_price_per_mtok
-           )""",
-        {"model_key": key, **attrs},
-    )
-    return cur.lastrowid
 
 
 # --------------------------------------------------------------------------- #
@@ -637,20 +564,54 @@ def _project_tool_call(conn: sqlite3.Connection, p: dict) -> bool:
     return cur.rowcount > 0
 
 
+def _reject_event(ev, reason: str) -> bool:
+    _record_metric("rejected")
+    log(
+        f"event rejected: {reason}",
+        level="warning",
+        event="event_rejected",
+        entity=ev.get("entity") if isinstance(ev, dict) else None,
+        event_id=ev.get("event_id") if isinstance(ev, dict) else None,
+        origin_node=ev.get("origin_node") if isinstance(ev, dict) else None,
+    )
+    return False
+
+
 def apply_event(conn: sqlite3.Connection, ev: dict) -> bool:
     """Store a (possibly remote) event and project it. Returns True if new.
 
     Idempotent: the oplog primary key drops duplicates, so a replayed or
     re-gossiped event is silently ignored.
+
+    Incoming events are never trusted verbatim: ``event_id`` must equal the
+    content hash of the payload it claims to carry, and the envelope fields
+    must be well-typed. A peer that cannot prove an event's content-addressed
+    identity does not get to insert it (a forged id would break the dedupe
+    invariant the whole replication design rests on, and a spoofable
+    ``origin_node`` would let one node fabricate another's usage history).
     """
-    payload = ev["payload"] if isinstance(ev["payload"], dict) else json.loads(ev["payload"])
+    if not isinstance(ev, dict):
+        return _reject_event(ev, "event is not an object")
+    try:
+        payload = ev["payload"] if isinstance(ev["payload"], dict) else json.loads(ev["payload"])
+        lamport = int(ev["lamport"])
+        entity = str(ev["entity"])
+        origin_node = str(ev["origin_node"] or "")
+        created_at = str(ev["created_at"])
+        event_id = str(ev.get("event_id") or "")
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return _reject_event(ev, "malformed envelope")
+    if not origin_node:
+        return _reject_event(ev, "missing origin_node")
+    if event_id != event_id_for(entity, _canonical(payload)):
+        return _reject_event(ev, "event_id does not match payload hash")
     canonical = _canonical(payload)
     cur = conn.execute(
         """INSERT OR IGNORE INTO oplog
                (event_id, origin_node, lamport, created_at, entity, op, payload)
            VALUES (?, ?, ?, ?, ?, ?, ?)""",
-        (ev["event_id"], ev["origin_node"], int(ev["lamport"]), ev["created_at"],
-         ev["entity"], ev.get("op", "upsert"), canonical),
+        (event_id, origin_node, lamport, created_at,
+         entity, ev.get("op", "upsert"), canonical),
     )
     if cur.rowcount == 0:
         _record_metric("dedupes")
@@ -795,6 +756,26 @@ def import_database(conn: sqlite3.Connection, other_db: Path, label: str | None)
 # --------------------------------------------------------------------------- #
 # HTTP transport -- mesh endpoints (separate from the loopback dashboard server).
 # --------------------------------------------------------------------------- #
+def _valid_advertise(peer: object) -> bool:
+    """True for a plausible ``host:port`` peer address.
+
+    The /mesh/announce heartbeat is network-driven input, so anything that
+    looks nothing like an address (or has a bogus port) must never reach the
+    persisted config, let alone be dialed later by the gossip loop.
+    """
+    if not isinstance(peer, str):
+        return False
+    host, sep, port = peer.rpartition(":")
+    if not sep or not host or not port.isdigit() or not (0 < int(port) <= 65535):
+        return False
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        pass
+    return re.fullmatch(r"[A-Za-z0-9._-]+", host) is not None
+
+
 class _PeerRegistry:
     """Configured seeds plus peers learned via startup registration."""
 
@@ -808,7 +789,9 @@ class _PeerRegistry:
             return sorted(self._peers)
 
     def add(self, peer: str) -> None:
-        if not peer:
+        if not _valid_advertise(peer):
+            if peer:
+                log(f"ignored invalid peer address {peer!r}", level="warning")
             return
         with self._lock:
             if peer in self._peers:
@@ -851,10 +834,18 @@ def _make_mesh_handler(cfg: dict, registry: _PeerRegistry, app_version: str,
             path, _, query = self.path.partition("?")
             params = dict(urllib.parse.parse_qsl(query, keep_blank_values=True))
             if path == "/mesh/discover":
+                # Anonymous discovery probe. Deliberately reveals nothing about
+                # which mesh this node belongs to: a caller who already knows
+                # the mesh id gets a yes/no match answer (enough for subnet
+                # rediscovery and for verifying a peer before joining), but a
+                # stranger scanning the LAN cannot harvest mesh ids -- and the
+                # mesh id is the only gate on every other endpoint.
+                presented = params.get("mesh_id")
                 self._send_json({
                     "ok": bool(cfg.get("enabled") and cfg.get("mesh_id") and cfg.get("node_id")),
-                    "mesh_id": cfg.get("mesh_id"),
-                    "node_id": cfg.get("node_id"),
+                    "mesh_id_match": bool(
+                        presented and presented == cfg.get("mesh_id")
+                    ),
                     "schema_version": int(cfg.get("schema_version", SCHEMA_VERSION)),
                 })
             elif path == "/mesh/hello":
@@ -907,10 +898,14 @@ def _make_mesh_handler(cfg: dict, registry: _PeerRegistry, app_version: str,
                 events = []
                 if ids:
                     with _db(db_path) as conn:
+                        # ORDER BY lamport: within a batch, a turn event applies
+                        # before the tool_calls that reference it, so the
+                        # projected tool_calls link to their turn via turn_pk.
                         for row in conn.execute(
                             f"""SELECT event_id, origin_node, lamport, created_at,
                                        entity, op, payload
-                                FROM oplog WHERE event_id IN ({qmarks})""",
+                                FROM oplog WHERE event_id IN ({qmarks})
+                                ORDER BY lamport""",
                             ids,
                         ):
                             events.append({
@@ -1460,8 +1455,16 @@ def _hosts_for_subnets(subnets: list[str], cap: int = DISCOVERY_MAX_HOSTS) -> li
 
 
 def probe_discovery(host: str, port: int = DEFAULT_PORT,
-                    timeout: float = DISCOVERY_TIMEOUT) -> dict | None:
-    """Return anonymous mesh discovery metadata for a reachable node."""
+                    timeout: float = DISCOVERY_TIMEOUT,
+                    mesh_id: str | None = None) -> dict | None:
+    """Probe a host with the anonymous discovery endpoint.
+
+    The response never contains a mesh id; when ``mesh_id`` is supplied it is
+    presented as a candidate and a positive ``mesh_id_match`` proves the host
+    belongs to that mesh (the caller already knows the id, so echoing it back
+    is harmless). Returns None for unreachable hosts or non-drachometer
+    services.
+    """
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.settimeout(timeout)
         try:
@@ -1470,13 +1473,24 @@ def probe_discovery(host: str, port: int = DEFAULT_PORT,
         except OSError:
             return None
     try:
-        hello = _get_json(f"{host}:{port}", "/mesh/discover", timeout=timeout)
+        answer = _get_json(
+            f"{host}:{port}",
+            _mesh_path("/mesh/discover", mesh_id) if mesh_id else "/mesh/discover",
+            timeout=timeout,
+        )
     except Exception:
         return None
-    if not isinstance(hello, dict) or not hello.get("ok") or not hello.get("mesh_id"):
+    if not isinstance(answer, dict) or not answer.get("ok"):
         return None
-    hello["advertise"] = f"{host}:{port}"
-    return hello
+    result = {
+        "advertise": f"{host}:{port}",
+        "mesh_id_match": bool(answer.get("mesh_id_match")),
+        "schema_version": answer.get("schema_version"),
+    }
+    if mesh_id and result["mesh_id_match"]:
+        result["mesh_id"] = mesh_id
+        result["node_id"] = None
+    return result
 
 
 def probe_node(host: str, port: int = DEFAULT_PORT, timeout: float = DISCOVERY_TIMEOUT,
@@ -1533,27 +1547,40 @@ def _group_meshes(hellos: list[dict], current_mesh_id: str | None) -> list[dict]
 def discover_meshes(port: int = DEFAULT_PORT, timeout: float = DISCOVERY_TIMEOUT,
                     subnets: list[str] | None = None,
                     max_workers: int = DISCOVERY_MAX_WORKERS) -> dict:
-    """Scan local subnets on all enabled NICs for reachable mesh nodes.
+    """Scan local subnets on all enabled NICs for reachable drachometer nodes.
 
-    Groups the responses by mesh id and marks the mesh this node currently
-    belongs to. The result is cached for the live-status endpoint so the header
-    indicator can list adjacent meshes without re-scanning every poll.
+    Nodes answering for the mesh this node currently belongs to are grouped
+    under it (this is what lets a dark peer be rediscovered after its address
+    changed). Every other reachable drachometer node is reported in
+    ``unmatched_nodes`` *without* a mesh id -- the discovery endpoint is
+    anonymous, so a scan can never harvest other meshes' identities. The result
+    is cached for the live-status endpoint so the header indicator can list
+    nearby nodes without re-scanning every poll.
     """
     cfg = load_config() or {}
     current = cfg.get("mesh_id") if cfg.get("enabled") else None
     subnets = subnets if subnets is not None else list_local_subnets()
     hosts = _hosts_for_subnets(subnets)
-    hellos: list[dict] = []
+    probes: list[dict] = []
     if hosts:
         with ThreadPoolExecutor(max_workers=min(max_workers, len(hosts))) as pool:
-            for hello in pool.map(lambda h: probe_discovery(h, port, timeout), hosts):
-                if hello:
-                    hellos.append(hello)
-    meshes = _group_meshes(hellos, current)
+            for probe in pool.map(
+                lambda h: probe_discovery(h, port, timeout, mesh_id=current), hosts
+            ):
+                if probe:
+                    probes.append(probe)
+    matched = [p for p in probes if p.get("mesh_id")]
+    unmatched = [
+        {"advertise": p["advertise"], "node_id": None}
+        for p in probes
+        if not p.get("mesh_id")
+    ]
+    meshes = _group_meshes(matched, current)
     result = {
         "subnets": subnets,
         "scanned_hosts": len(hosts),
         "meshes": meshes,
+        "unmatched_nodes": unmatched,
         "current_mesh_id": current,
         "scanned_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -1694,10 +1721,9 @@ def runtime_status() -> dict:
         last_sync_at = _RUNTIME.get("last_sync_at")
         running = _RUNTIME.get("server") is not None
         last_scan = _RUNTIME.get("last_scan")
-    adjacent = []
+    unmatched = []
     if last_scan:
-        adjacent = [m for m in last_scan.get("meshes", [])
-                    if not m.get("is_current") and m.get("node_count", 0) >= 1]
+        unmatched = list(last_scan.get("unmatched_nodes") or [])
     return {
         "available": True,
         "enabled": enabled,
@@ -1713,9 +1739,40 @@ def runtime_status() -> dict:
         "last_sync_at": last_sync_at,
         "uptime_seconds": mesh_uptime_seconds() if enabled else None,
         "mean_propagation_seconds": mean_propagation_seconds() if enabled else None,
-        "adjacent_meshes": adjacent,
+        "adjacent_meshes": [],
+        "nearby_nodes": unmatched,
+        "listen_host": cfg.get("listen_host", "0.0.0.0"),
         "listen_port": int(cfg.get("listen_port", DEFAULT_PORT)),
+        # What other nodes should be told to reach us: the advertise address
+        # pairs with the mesh id in the share string the dashboard copies.
+        "lan_ip": detect_lan_ip(),
+        "advertise": f"{cfg.get('advertise_host') or detect_lan_ip()}:"
+                     f"{cfg.get('advertise_port', DEFAULT_PORT)}",
     }
+
+
+def set_listen_host(host: str | None) -> dict:
+    """Persist the mesh listener bind address and restart the mesh server.
+
+    Accepts only 0.0.0.0, the loopback address, or an IPv4 currently configured
+    on one of this machine's interfaces -- the dashboard's listen-interface
+    selector offers exactly those choices, and everything else is rejected
+    rather than written into the config to fail at next bind.
+    """
+    cfg = load_config()
+    if not cfg:
+        return {"ok": False, "error": "mesh is not configured"}
+    if host not in {None, "", "0.0.0.0", "127.0.0.1"} and host not in {
+        ip for ip, _ in list_local_interfaces()
+    }:
+        return {"ok": False, "error": f"not a local interface address: {host}"}
+    cfg["listen_host"] = host or "0.0.0.0"
+    save_config(cfg)
+    log(f"listen host set to {cfg['listen_host']}")
+    started = False
+    if cfg.get("enabled") and cfg.get("mesh_id") and cfg.get("node_id"):
+        started = start_mesh(_current_app_version())
+    return {"ok": True, "listen_host": cfg["listen_host"], "started": started}
 
 
 # --------------------------------------------------------------------------- #
@@ -2004,15 +2061,449 @@ def cmd_discover(args) -> int:
     result = discover_meshes(port=args.port)
     print(f"Scanned {result['scanned_hosts']} host(s) across {len(result['subnets'])} subnet(s): "
           f"{', '.join(result['subnets']) or '(none)'}")
-    if not result["meshes"]:
-        print("No mesh networks found.")
-        return 0
     for m in result["meshes"]:
         marker = " (current)" if m["is_current"] else ""
         print(f"  {m['name']}-{m['suffix']}{marker}: {m['node_count']} node(s)")
         for node in m["nodes"]:
             print(f"      {node['advertise']}")
+    for node in result.get("unmatched_nodes", []):
+        print(f"  nearby drachometer node: {node['advertise']} (mesh id not disclosed)")
+    if not result["meshes"] and not result.get("unmatched_nodes"):
+        print("No drachometer nodes found.")
     return 0
+
+
+# --------------------------------------------------------------------------- #
+# Self-test: a self-contained, headless two-node replication simulation
+# --------------------------------------------------------------------------- #
+SELFTEST_MODEL_KEY = "claude-sonnet-4-5"
+
+
+def run_self_test() -> dict:
+    """Simulate a two-node mesh end-to-end and verify it behaves per spec.
+
+    Entirely self-contained and headless: both simulated nodes run the real
+    production HTTP handler on ephemeral 127.0.0.1 ports with throwaway
+    databases in a temp directory and a throwaway mesh id. Nothing here reads
+    or writes the real mesh configuration, the real drachometer database, or
+    the real mesh log, so it is safe to run whether mesh is enabled, disabled,
+    or unconfigured. Because ``sync_with_peer`` resolves the local database at
+    call time through the module global, this should run in a dedicated
+    process (the ``self-test`` CLI subcommand) rather than alongside a live
+    gossip daemon.
+
+    Every replication step goes over real loopback HTTP using the same
+    pull-based anti-entropy gossip the daemon runs, so the checks exercise
+    the spec, not a mock of it:
+
+      1. discovery probes never reveal a mesh id; a presented id matches
+         only for the right mesh
+      2. the handshake proves node identity; every data endpoint rejects a
+         wrong mesh id (403); announce registers the peer (heartbeat)
+      3. initial pull-based sync converges both oplogs in both directions
+      4. replicated turns project faithfully (tokens + model resolution)
+      5. new records emitted mid-test propagate, with tool_calls linked
+      6. last-writer-wins: a newer update replaces, a stale one is suppressed
+      7. re-syncing applies nothing (content-addressed idempotency)
+      8. synthetic ``__dunder__`` session ids never materialize
+      9. every stored event's id equals its content hash
+     10. an event whose id does not match its payload is refused end-to-end
+
+    Returns ``{"ok", "passed", "total", "duration_seconds", "checks"}`` where
+    each check is ``{"name", "ok", "detail"}``.
+    """
+    started = time.monotonic()
+    checks: list[dict] = []
+
+    def check(name: str, ok: bool, detail: str) -> None:
+        checks.append({"name": name, "ok": bool(ok), "detail": str(detail)})
+        log(
+            f"self-test check {'passed' if ok else 'FAILED'}: {name}",
+            level="info" if ok else "error",
+            event="selftest_check",
+            check=name,
+            detail=str(detail),
+        )
+
+    def oplog_ids(db_path: Path) -> list[str]:
+        with _db(db_path) as conn:
+            return [r[0] for r in conn.execute("SELECT event_id FROM oplog")]
+
+    def turn_row(db_path: Path, session_id: str, turn_id: str = "turn-1"):
+        with _db(db_path) as conn:
+            return conn.execute(
+                """SELECT t.input_tokens, t.output_tokens, t.cache_read_tokens,
+                          t.cache_creation_tokens, t.recorded_at, m.model_key
+                   FROM turns t LEFT JOIN models m ON t.model_id = m.id
+                   WHERE t.session_id = ? AND t.turn_id = ?""",
+                (session_id, turn_id),
+            ).fetchone()
+
+    global DB_PATH, LOG_PATH
+    old_db_path, old_log_path = DB_PATH, LOG_PATH
+    tmp = tempfile.TemporaryDirectory(prefix="drach-mesh-selftest-")
+    servers: list[_ThreadingHTTPServer] = []
+    try:
+        tmp_path = Path(tmp.name)
+        # Safety net for any stray _db() call: point module globals into the
+        # sandbox, never at the real database or log.
+        DB_PATH = tmp_path / "unused.db"
+        LOG_PATH = tmp_path / "selftest.log"
+        reset_metrics()
+
+        mesh_id = f"selftest-{uuid.uuid4().hex[:8]}"
+
+        def make_node(node_id: str, compress_payloads: bool) -> dict:
+            db_path = tmp_path / f"{node_id}.db"
+            with _db(db_path) as conn:
+                common.ensure_base_schema(conn, backfill_model_ids=False)
+                ensure_schema(conn)
+            cfg = normalize_config({
+                "enabled": True,
+                "mesh_id": mesh_id,
+                "node_id": node_id,
+                "listen_host": "127.0.0.1",
+                "advertise_host": "127.0.0.1",
+                # One node compresses so the gzip response path is exercised;
+                # the other answers plain so both transports get coverage.
+                "compress_payloads": compress_payloads,
+                "log_level": "info",
+            })
+            registry = _PeerRegistry(cfg)
+            handler = _make_mesh_handler(cfg, registry, "selftest", db_path=db_path)
+            server = _ThreadingHTTPServer(("127.0.0.1", 0), handler)
+            servers.append(server)
+            threading.Thread(
+                target=server.serve_forever,
+                kwargs={"poll_interval": 0.05},
+                daemon=True,
+            ).start()
+            return {
+                "node_id": node_id,
+                "db": db_path,
+                "cfg": cfg,
+                "registry": registry,
+                "peer": f"127.0.0.1:{server.server_address[1]}",
+                "port": server.server_address[1],
+            }
+
+        node_a = make_node("selftest-node-a", compress_payloads=True)
+        node_b = make_node("selftest-node-b", compress_payloads=False)
+
+        session_a = "aaaaaaaa-1111-4aaa-8aaa-aaaaaaaaaaaa"
+        session_b = "bbbbbbbb-2222-4bbb-8bbb-bbbbbbbbbbbb"
+        session_c = "cccccccc-3333-4ccc-8ccc-cccccccccccc"
+
+        def seed_turn(node: dict, payload: dict) -> None:
+            """Simulate the hook writing a turn (+ one tool call), then the
+            content-addressed backfill turning it into oplog events."""
+            with _db(node["db"]) as conn:
+                model_id = ensure_model_row(conn, payload["model_key"])
+                conn.execute(
+                    """INSERT INTO turns (session_id, turn_id, recorded_at, stop_reason,
+                           input_tokens, output_tokens, cache_read_tokens,
+                           cache_creation_tokens, cwd, git_branch, model_id)
+                       VALUES (:session_id, :turn_id, :recorded_at, :stop_reason,
+                           :input_tokens, :output_tokens, :cache_read_tokens,
+                           :cache_creation_tokens, :cwd, :git_branch, :model_id)""",
+                    {**payload, "model_id": model_id},
+                )
+                conn.execute(
+                    """INSERT INTO tool_calls (uid, turn_pk, session_id, turn_id,
+                           recorded_at, tool_name, tool_input, exit_code, error)
+                       VALUES (?, NULL, ?, ?, ?, 'Bash', '{"cmd":"selftest"}', 0, NULL)""",
+                    (f"{node['node_id']}-{payload['turn_id']}",
+                     payload["session_id"], payload["turn_id"],
+                     payload["recorded_at"]),
+                )
+                backfill(conn, node["node_id"])
+
+        def pull(target: dict, source: dict) -> int:
+            # sync_with_peer resolves the *local* side via the module-global
+            # DB_PATH: point it at the node being synced for this call.
+            global DB_PATH
+            DB_PATH = target["db"]
+            return sync_with_peer(target["cfg"], source["peer"])
+
+        turn_a1 = {
+            "session_id": session_a, "turn_id": "turn-1",
+            "recorded_at": "2026-09-29T10:00:00+00:00",
+            "stop_reason": "end_turn",
+            "input_tokens": 100, "output_tokens": 50,
+            "cache_read_tokens": 400, "cache_creation_tokens": 2000,
+            "cwd": "/tmp/drach-selftest", "git_branch": "main",
+            "model_key": SELFTEST_MODEL_KEY,
+        }
+        turn_b1 = dict(turn_a1, session_id=session_b,
+                       input_tokens=200, output_tokens=80,
+                       cache_read_tokens=0, cache_creation_tokens=0)
+        seed_turn(node_a, turn_a1)
+        seed_turn(node_b, turn_b1)
+
+        # -- 1. discovery: anonymous probes learn nothing ----------------------
+        anon = _get_json(node_a["peer"], "/mesh/discover")
+        check(
+            "discovery_anonymous_probe_leaks_nothing",
+            bool(anon.get("ok")) and anon.get("mesh_id_match") is False
+            and "mesh_id" not in anon,
+            f"anonymous /mesh/discover answered ok with keys {sorted(anon)}",
+        )
+        probe = probe_discovery("127.0.0.1", node_a["port"], timeout=2.0,
+                                mesh_id=mesh_id)
+        check(
+            "discovery_presented_id_matches",
+            bool(probe) and probe.get("mesh_id_match") is True,
+            f"presented mesh id matched: {probe}",
+        )
+        probe_wrong = probe_discovery(
+            "127.0.0.1", node_a["port"], timeout=2.0,
+            mesh_id=f"stranger-{uuid.uuid4().hex[:8]}",
+        )
+        check(
+            "discovery_foreign_id_reports_no_match",
+            bool(probe_wrong) and probe_wrong.get("mesh_id_match") is False
+            and "mesh_id" not in probe_wrong,
+            f"foreign mesh id probe: {probe_wrong}",
+        )
+
+        # -- 2. handshake + per-endpoint mesh-id gate + announce heartbeat -----
+        hello = _get_json(node_a["peer"], _mesh_path("/mesh/hello", mesh_id))
+        check(
+            "handshake_proves_identity",
+            hello.get("ok") is True
+            and hello.get("node_id") == node_a["node_id"]
+            and int(hello.get("schema_version", 0)) == SCHEMA_VERSION,
+            f"hello: node_id={hello.get('node_id')!r}, "
+            f"schema={hello.get('schema_version')!r}",
+        )
+        stranger = f"stranger-{uuid.uuid4().hex[:8]}"
+        hello_bad = _get_json(node_a["peer"], _mesh_path("/mesh/hello", stranger))
+        check(
+            "handshake_rejects_wrong_mesh_id",
+            hello_bad.get("ok") is False and "node_id" not in hello_bad,
+            f"stranger hello: {hello_bad}",
+        )
+
+        def expects_403(fn) -> bool:
+            try:
+                fn()
+            except urllib.error.HTTPError as exc:
+                return exc.code == 403
+            except Exception:
+                return False
+            return False
+
+        gated = all([
+            expects_403(lambda: _get_json(
+                node_a["peer"], _mesh_path("/mesh/digest", stranger))),
+            expects_403(lambda: _get_json(
+                node_a["peer"],
+                _mesh_path("/mesh/event-ids", stranger, origin=node_b["node_id"]))),
+            expects_403(lambda: _post_json(
+                node_a["peer"], "/mesh/events",
+                {"mesh_id": stranger, "ids": ["x"]})),
+            expects_403(lambda: _post_json(
+                node_a["peer"], "/mesh/announce", {"mesh_id": stranger})),
+        ])
+        check(
+            "endpoints_reject_wrong_mesh_id",
+            gated,
+            "digest, event-ids, events and announce all answered 403 "
+            f"for mesh id {stranger!r}",
+        )
+
+        ack = _post_json(node_b["peer"], "/mesh/announce",
+                         {"mesh_id": mesh_id, "advertise": node_a["peer"]})
+        check(
+            "announce_heartbeat_registers_peer",
+            ack.get("ok") is True and node_a["peer"] in node_b["registry"].all(),
+            f"announce ack={ack}, B's registry={node_b['registry'].all()}",
+        )
+
+        # -- 3. initial bidirectional sync converges both oplogs ---------------
+        applied_a = pull(node_a, node_b)
+        applied_b = pull(node_b, node_a)
+        ids_a = oplog_ids(node_a["db"])
+        ids_b = oplog_ids(node_b["db"])
+        check(
+            "initial_sync_converges",
+            applied_a == 2 and applied_b == 2
+            and ids_a == ids_b and len(ids_a) == 4,
+            f"A applied {applied_a}, B applied {applied_b}; "
+            f"oplogs hold {len(ids_a)} vs {len(ids_b)} event(s)",
+        )
+        check(
+            "initial_sync_is_bidirectional",
+            turn_row(node_a["db"], session_b) is not None
+            and turn_row(node_b["db"], session_a) is not None,
+            "each node materialized the other node's turn",
+        )
+
+        # -- 4. projection fidelity --------------------------------------------
+        row = turn_row(node_b["db"], session_a)
+        check(
+            "replicated_turn_matches_source",
+            bool(row) and tuple(row[:4]) == (100, 50, 400, 2000)
+            and row[5] == SELFTEST_MODEL_KEY,
+            f"B's replica of A's turn: tokens={tuple(row[:4]) if row else None}, "
+            f"model_key={row[5]!r}",
+        )
+
+        # -- 5. new records propagate mid-flight --------------------------------
+        seed_turn(node_a, dict(turn_a1, turn_id="turn-2",
+                               recorded_at="2026-09-29T10:01:00+00:00"))
+        applied = pull(node_b, node_a)
+        with _db(node_b["db"]) as conn:
+            linked = conn.execute(
+                """SELECT t.id IS NOT NULL FROM tool_calls tc
+                   LEFT JOIN turns t ON t.id = tc.turn_pk
+                   WHERE tc.session_id = ? AND tc.turn_id = 'turn-2'""",
+                (session_a,),
+            ).fetchone()
+        check(
+            "new_records_propagate",
+            applied >= 2 and turn_row(node_b["db"], session_a, "turn-2") is not None
+            and bool(linked) and linked[0] == 1,
+            f"B applied {applied} new event(s); replicated tool_call's "
+            f"turn_pk resolved: {bool(linked) and linked[0] == 1}",
+        )
+
+        # -- 6. last-writer-wins -------------------------------------------------
+        with _db(node_a["db"]) as conn:
+            conn.execute(
+                "UPDATE turns SET output_tokens = 99, recorded_at = ? "
+                "WHERE session_id = ? AND turn_id = 'turn-1'",
+                ("2026-09-29T10:05:00+00:00", session_a),
+            )
+            backfill(conn, node_a["node_id"])
+        pull(node_b, node_a)
+        check(
+            "lww_newer_update_wins",
+            turn_row(node_b["db"], session_a)[1] == 99,
+            "B's turn shows the newer output_tokens (99)",
+        )
+
+        stale = dict(turn_a1, output_tokens=11,
+                     recorded_at="2026-09-29T09:00:00+00:00")
+        stale_canonical = _canonical(stale)
+        stale_id = event_id_for("turn", stale_canonical)
+        with _db(node_a["db"]) as conn:
+            conn.execute(
+                """INSERT INTO oplog
+                       (event_id, origin_node, lamport, created_at, entity, op, payload)
+                   VALUES (?, ?, ?, ?, 'turn', 'upsert', ?)""",
+                (stale_id, node_a["node_id"], _next_lamport(conn),
+                 stale["recorded_at"], stale_canonical),
+            )
+        pull(node_b, node_a)
+        check(
+            "lww_stale_event_suppressed",
+            turn_row(node_b["db"], session_a)[1] == 99
+            and stale_id in oplog_ids(node_b["db"]),
+            "stale event reached B's oplog but the turn kept the newer values",
+        )
+
+        # -- 7. re-sync is a no-op (content-addressed idempotency) ---------------
+        applied_a = pull(node_a, node_b)
+        applied_b = pull(node_b, node_a)
+        check(
+            "re_sync_is_idempotent",
+            applied_a == 0 and applied_b == 0
+            and oplog_ids(node_a["db"]) == oplog_ids(node_b["db"]),
+            f"second round applied {applied_a}/{applied_b} event(s); "
+            "oplogs remain identical",
+        )
+
+        # -- 8. synthetic session ids never materialize ---------------------------
+        synthetic = dict(turn_a1, session_id="__selftest_synthetic__")
+        with _db(node_a["db"]) as conn:
+            emit_event(conn, node_a["node_id"], "turn", synthetic)
+        pull(node_b, node_a)
+        with _db(node_b["db"]) as conn:
+            leaked = conn.execute(
+                "SELECT COUNT(*) FROM turns WHERE session_id = '__selftest_synthetic__'"
+            ).fetchone()[0]
+        check(
+            "synthetic_session_never_projects",
+            leaked == 0,
+            f"reserved __dunder__ session produced {leaked} turn row(s) on B",
+        )
+
+        # -- 9. every stored event's id equals its content hash -------------------
+        def integrity_violations(db_path: Path) -> list[str]:
+            with _db(db_path) as conn:
+                return [
+                    eid for eid, entity, payload in conn.execute(
+                        "SELECT event_id, entity, payload FROM oplog")
+                    if eid != event_id_for(entity, payload)
+                ]
+
+        violations = integrity_violations(node_a["db"]) \
+            + integrity_violations(node_b["db"])
+        check(
+            "oplog_content_addresses_intact",
+            not violations,
+            f"verified {len(oplog_ids(node_a['db']))}+"
+            f"{len(oplog_ids(node_b['db']))} event id(s) against their payloads",
+        )
+
+        # -- 10. a forged event_id is refused end-to-end ---------------------------
+        forged_canonical = _canonical(dict(turn_a1, session_id=session_c))
+        with _db(node_a["db"]) as conn:
+            conn.execute(
+                """INSERT INTO oplog
+                       (event_id, origin_node, lamport, created_at, entity, op, payload)
+                   VALUES (?, ?, ?, ?, 'turn', 'upsert', ?)""",
+                ("0" * 40, node_a["node_id"], _next_lamport(conn),
+                 "2026-09-29T10:06:00+00:00", forged_canonical),
+            )
+        rejected_before = int(_METRICS.get("rejected") or 0)
+        applied = pull(node_b, node_a)
+        with _db(node_b["db"]) as conn:
+            leaked = conn.execute(
+                "SELECT COUNT(*) FROM turns WHERE session_id = ?", (session_c,)
+            ).fetchone()[0]
+        check(
+            "forged_event_rejected_end_to_end",
+            applied == 0 and "0" * 40 not in oplog_ids(node_b["db"])
+            and leaked == 0 and int(_METRICS.get("rejected") or 0) > rejected_before,
+            f"B refused the forged event (applied {applied}, "
+            f"{_METRICS.get('rejected')} lifetime rejection(s))",
+        )
+    except Exception as exc:  # unexpected failure -> report, don't raise
+        check("self_test_completed", False, f"unexpected error: {exc!r}")
+    finally:
+        for server in servers:
+            server.shutdown()
+            server.server_close()
+        DB_PATH, LOG_PATH = old_db_path, old_log_path
+        try:
+            tmp.cleanup()
+        except OSError:
+            pass
+
+    passed = sum(1 for c in checks if c["ok"])
+    return {
+        "ok": bool(checks) and passed == len(checks),
+        "passed": passed,
+        "total": len(checks),
+        "duration_seconds": round(time.monotonic() - started, 2),
+        "checks": checks,
+    }
+
+
+def cmd_self_test(args) -> int:
+    report = run_self_test()
+    if args.json:
+        print(json.dumps(report, indent=2))
+    else:
+        for c in report["checks"]:
+            print(f"[{'PASS' if c['ok'] else 'FAIL'}] {c['name']} -- {c['detail']}")
+        verdict = "PASSED" if report["ok"] else "FAILED"
+        print(f"\nMesh self-test {verdict}: "
+              f"{report['passed']}/{report['total']} check(s) "
+              f"in {report['duration_seconds']:.1f}s")
+    return 0 if report["ok"] else 1
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -2058,6 +2549,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_discover = sub.add_parser("discover", help="Scan local subnets for reachable mesh networks.")
     p_discover.add_argument("--port", type=int, default=DEFAULT_PORT)
     p_discover.set_defaults(func=cmd_discover)
+
+    p_selftest = sub.add_parser(
+        "self-test",
+        help="Simulate a two-node mesh in a sandbox and verify replication behavior.",
+    )
+    p_selftest.add_argument(
+        "--json", action="store_true",
+        help="Print the machine-readable report instead of the human summary.",
+    )
+    p_selftest.set_defaults(func=cmd_self_test)
     return parser
 
 

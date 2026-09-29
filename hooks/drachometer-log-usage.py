@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 import json
 import os
-import re
 import sqlite3
 import subprocess
 import sys
@@ -9,10 +8,21 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-# Optional mesh replication. Importable from the same directory the installer
-# copies both files into; absence (or any import error) leaves logging fully
-# functional as a single-node tracker.
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+# Both helpers are importable from the same directory the installer copies all
+# files into. drachometer_common (pricing, model inference, base schema) is
+# required; the mesh module is optional -- its absence (or any import error)
+# leaves logging fully functional as a single-node tracker.
+_HOOK_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(_HOOK_DIR))
+# In a repo checkout the helper modules sit one level up (hooks/ vs. root);
+# installed layouts have everything in the same directory, so this is a no-op.
+sys.path.insert(1, str(_HOOK_DIR.parent))
+try:
+    import drachometer_common as common
+except Exception as exc:  # never block Claude Code, but make the cause findable
+    print(f"drachometer hook: drachometer_common unavailable: {exc}", file=sys.stderr)
+    raise SystemExit(0)
+
 try:
     import drachometer_mesh as mesh
 except Exception:
@@ -20,192 +30,30 @@ except Exception:
 
 DB_PATH = Path.home() / ".claude" / "drachometer.db"
 SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
+LOG_PATH = Path.home() / ".claude" / "drachometer-hook.log"
 LEGACY_DASHBOARD_SERVER = Path.home() / ".claude" / "hooks" / "drachometer-serve-report.py"
 DASHBOARD_SERVER = Path.home() / ".claude" / "hooks" / "drachometer" / "drachometer-serve-dashboard.py"
 DASHBOARD_PORT = 9873
 
-# Offline fallback pricing (USD per 1M tokens). Overlaid at import by values
-# from drachometer-pricing.json (installed alongside this script, kept fresh by a GitHub
-# Action) so newly-logged models are priced from the latest published rates.
-MODEL_TIER_PRICING = {
-    "opus":   {"input": 5.0, "output": 25.0, "cache_read": 0.50, "cache_create": 6.25},
-    "sonnet": {"input": 3.0, "output": 15.0, "cache_read": 0.30, "cache_create": 3.75},
-    "haiku":  {"input": 1.0, "output": 5.0,  "cache_read": 0.10, "cache_create": 1.25},
-}
 
+def hook_log(message: str, level: str = "error", **fields) -> None:
+    """Append a JSON log line to ~/.claude/drachometer-hook.log.
 
-def _load_pricing_overrides() -> None:
-    pricing_path = Path(__file__).resolve().parent / "drachometer-pricing.json"
-    try:
-        data = json.loads(pricing_path.read_text(encoding="utf-8"))
-        tiers = data.get("tiers", data)
-        if isinstance(tiers, dict):
-            for tier, p in tiers.items():
-                if isinstance(p, dict) and isinstance(p.get("input"), (int, float)):
-                    MODEL_TIER_PRICING[tier] = {
-                        "input": p.get("input"),
-                        "output": p.get("output"),
-                        "cache_read": p.get("cache_read"),
-                        "cache_create": p.get("cache_create"),
-                    }
-    except Exception:
-        pass
-
-
-_load_pricing_overrides()
-
-
-def infer_model_attributes(model_key: str | None) -> dict:
-    key = (model_key or "").strip()
-    lower = key.lower()
-    if not key:
-        return {
-            "model_name": None,
-            "model_version": None,
-            "model_provider": None,
-            "input_price_per_mtok": None,
-            "output_price_per_mtok": None,
-            "cache_read_price_per_mtok": None,
-            "cache_creation_price_per_mtok": None,
-        }
-
-    if "fable" in lower:
-        tier = "fable"
-    elif "opus" in lower:
-        tier = "opus"
-    elif "sonnet" in lower:
-        tier = "sonnet"
-    elif "haiku" in lower:
-        tier = "haiku"
-    else:
-        tier = None
-
-    parts = [p for p in key.split("-") if p]
-    model_name = " ".join(parts[:2]).title() if len(parts) >= 2 and parts[0].lower() == "claude" else (parts[0].title() if parts else None)
-    version_match = re.search(r"(\d+(?:[-.]\d+)*(?:-\d{8})?)", key)
-    model_version = version_match.group(1) if version_match else None
-    provider = "Anthropic" if lower.startswith("claude-") or lower.startswith("claude") else None
-
-    pricing = MODEL_TIER_PRICING.get(tier, {})
-    return {
-        "model_name": model_name,
-        "model_version": model_version,
-        "model_provider": provider,
-        "input_price_per_mtok": pricing.get("input"),
-        "output_price_per_mtok": pricing.get("output"),
-        "cache_read_price_per_mtok": pricing.get("cache_read"),
-        "cache_creation_price_per_mtok": pricing.get("cache_create"),
+    The hook used to swallow every exception silently, which made a broken
+    install undiagnosable. Errors are rare and the file stays tiny; write
+    failures are still swallowed because there is nowhere else to report them.
+    """
+    entry = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "level": level,
+        "message": message,
     }
-
-
-def ensure_model_row(conn: sqlite3.Connection, model_key: str | None) -> int | None:
-    key = (model_key or "").strip()
-    if not key:
-        return None
-
-    row = conn.execute("SELECT id FROM models WHERE model_key = ?", (key,)).fetchone()
-    if row:
-        return row[0]
-
-    attrs = infer_model_attributes(key)
-    cur = conn.execute(
-        """
-        INSERT INTO models (
-            model_key, model_name, model_version, model_provider,
-            input_price_per_mtok, output_price_per_mtok,
-            cache_read_price_per_mtok, cache_creation_price_per_mtok
-        ) VALUES (
-            :model_key, :model_name, :model_version, :model_provider,
-            :input_price_per_mtok, :output_price_per_mtok,
-            :cache_read_price_per_mtok, :cache_creation_price_per_mtok
-        )
-        """,
-        {"model_key": key, **attrs},
-    )
-    return cur.lastrowid
-
-
-def backfill_model_dimension(conn: sqlite3.Connection) -> None:
-    rows = conn.execute(
-        "SELECT id, model FROM turns WHERE model_id IS NULL AND model IS NOT NULL AND TRIM(model) <> ''"
-    ).fetchall()
-    for turn_pk, model_key in rows:
-        model_id = ensure_model_row(conn, model_key)
-        if model_id is not None:
-            conn.execute("UPDATE turns SET model_id = ? WHERE id = ?", (model_id, turn_pk))
-
-
-def init_db(conn: sqlite3.Connection) -> None:
-    conn.executescript("""
-        CREATE TABLE IF NOT EXISTS models (
-            id                           INTEGER PRIMARY KEY AUTOINCREMENT,
-            model_key                    TEXT    NOT NULL UNIQUE,
-            model_name                   TEXT,
-            model_version                TEXT,
-            model_provider               TEXT,
-            input_price_per_mtok         REAL,
-            output_price_per_mtok        REAL,
-            cache_read_price_per_mtok    REAL,
-            cache_creation_price_per_mtok REAL
-        );
-
-        CREATE TABLE IF NOT EXISTS turns (
-            id                    INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id            TEXT    NOT NULL,
-            turn_id               TEXT    NOT NULL,
-            recorded_at           TEXT    NOT NULL,
-            stop_reason           TEXT,
-            input_tokens          INTEGER NOT NULL DEFAULT 0,
-            output_tokens         INTEGER NOT NULL DEFAULT 0,
-            cache_read_tokens     INTEGER NOT NULL DEFAULT 0,
-            cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
-            model_id              INTEGER REFERENCES models(id),
-            UNIQUE(session_id, turn_id)
-        );
-
-        CREATE TABLE IF NOT EXISTS tool_calls (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            turn_pk     INTEGER REFERENCES turns(id) ON DELETE CASCADE,
-            session_id  TEXT    NOT NULL,
-            turn_id     TEXT    NOT NULL,
-            recorded_at TEXT    NOT NULL,
-            tool_name   TEXT,
-            tool_input  TEXT,
-            exit_code   INTEGER,
-            error       TEXT
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_turns_session ON turns(session_id, turn_id);
-        CREATE INDEX IF NOT EXISTS idx_calls_turn_pk ON tool_calls(turn_pk);
-        CREATE INDEX IF NOT EXISTS idx_calls_session ON tool_calls(session_id, turn_id);
-
-        -- Mesh replication oplog (empty and harmless when mesh is disabled).
-        CREATE TABLE IF NOT EXISTS oplog (
-            event_id    TEXT    PRIMARY KEY,
-            origin_node TEXT    NOT NULL,
-            lamport     INTEGER NOT NULL,
-            created_at  TEXT    NOT NULL,
-            entity      TEXT    NOT NULL,
-            op          TEXT    NOT NULL DEFAULT 'upsert',
-            payload     TEXT    NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_oplog_origin_lamport ON oplog(origin_node, lamport);
-        CREATE INDEX IF NOT EXISTS idx_oplog_lamport        ON oplog(lamport);
-    """)
-    for col, typedef in [("cwd", "TEXT"), ("git_branch", "TEXT"), ("model", "TEXT"), ("model_id", "INTEGER REFERENCES models(id)")]:
-        try:
-            conn.execute(f"ALTER TABLE turns ADD COLUMN {col} {typedef}")
-        except sqlite3.OperationalError:
-            pass
-    # Global identity for tool_calls, used by mesh replication.
+    entry.update(fields)
     try:
-        conn.execute("ALTER TABLE tool_calls ADD COLUMN uid TEXT")
-    except sqlite3.OperationalError:
+        with LOG_PATH.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry, sort_keys=True, ensure_ascii=False) + "\n")
+    except OSError:
         pass
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_turns_model_id ON turns(model_id)")
-    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_tool_calls_uid ON tool_calls(uid)")
-    backfill_model_dimension(conn)
-    conn.commit()
 
 
 def ensure_dashboard_server() -> None:
@@ -256,12 +104,16 @@ def purge_old_records(conn: sqlite3.Connection, retention_days: int) -> None:
 
 
 def get_transcript_info(transcript_path: str) -> dict:
-    """Extract model, usage, and stop_reason from the current turn.
+    """Extract model, usage, stop_reason, and the user-message count in one pass.
 
     Sums usage across unique assistant API calls (by message ID) in the
     last turn (after the final user message).  The transcript contains
     multiple streaming snapshots per API response (same ``message.id``),
     so we deduplicate — only the *last* snapshot of each message is kept.
+
+    The user-message count is what ``turn-N`` turn ids are derived from;
+    reading and parsing the transcript once for both jobs halves the cost
+    of every Stop hook on long sessions.
     """
     info: dict = {
         "model": None,
@@ -272,6 +124,7 @@ def get_transcript_info(transcript_path: str) -> dict:
             "cache_creation_input_tokens": 0,
         },
         "stop_reason": None,
+        "turn_count": 0,
     }
     try:
         p = Path(transcript_path)
@@ -285,27 +138,26 @@ def get_transcript_info(transcript_path: str) -> dict:
         seen: dict[str, dict] = {}   # msg_id -> usage dict
         model = None
         stop_reason = None
+        turn_count = 0
 
         for line in p.read_text(encoding="utf-8").splitlines():
             line_s = line.strip()
             if not line_s:
                 continue
-            # Fast pre-filter before JSON parsing
-            if '"type":"user"' in line_s or '"type": "user"' in line_s:
-                try:
-                    obj = json.loads(line_s)
-                    if isinstance(obj, dict) and obj.get("type") == "user":
-                        seen.clear()
-                        model = None
-                        stop_reason = None
-                        continue
-                except (json.JSONDecodeError, ValueError):
-                    pass
-            if '"model"' not in line_s:
+            # One prefilter for both jobs before JSON parsing.
+            if '"type"' not in line_s and '"model"' not in line_s:
                 continue
             try:
                 obj = json.loads(line_s)
             except (json.JSONDecodeError, ValueError):
+                continue
+            if not isinstance(obj, dict):
+                continue
+            if obj.get("type") == "user":
+                turn_count += 1
+                seen.clear()
+                model = None
+                stop_reason = None
                 continue
             msg = obj.get("message") or {}
             if not msg.get("model"):
@@ -324,13 +176,15 @@ def get_transcript_info(transcript_path: str) -> dict:
         # Sum across unique API calls in this turn
         info["model"] = model
         info["stop_reason"] = stop_reason
+        info["turn_count"] = turn_count
         for u in seen.values():
             info["usage"]["input_tokens"] += u["input_tokens"]
             info["usage"]["output_tokens"] += u["output_tokens"]
             info["usage"]["cache_read_input_tokens"] += u["cache_read_input_tokens"]
             info["usage"]["cache_creation_input_tokens"] += u["cache_creation_input_tokens"]
-    except Exception:
-        pass
+    except Exception as exc:
+        hook_log("transcript parse failed", level="warning", error=str(exc),
+                 transcript=transcript_path)
     return info
 
 
@@ -346,36 +200,42 @@ def get_git_branch(cwd: str) -> str | None:
         return None
 
 
-def derive_turn_id(payload: dict) -> str:
-    """Count user messages in the transcript to get a stable per-turn ID.
+def derive_turn_id(payload: dict, turn_count: int | None = None) -> str:
+    """Stable per-turn ID: ``turn-<user message count>``.
 
-    Uses proper JSON parsing so that the string '"type":"user"' appearing
-    inside tool output or assistant content is not mis-counted as a user
-    message boundary.
+    Counts user messages in the transcript with proper JSON parsing so that
+    the string '"type":"user"' appearing inside tool output or assistant
+    content is not mis-counted as a user message boundary. Callers that have
+    already parsed the transcript (Stop hooks) pass ``turn_count`` so the
+    file is never read twice.
     """
     turn_id = payload.get("turn_id")
     if turn_id:
         return str(turn_id)
 
-    transcript = payload.get("transcript_path", "")
-    if transcript:
-        try:
-            p = Path(transcript)
-            if p.exists():
-                count = 0
-                for line in p.read_text(encoding="utf-8").splitlines():
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        obj = json.loads(line)
-                        if isinstance(obj, dict) and obj.get("type") == "user":
-                            count += 1
-                    except (json.JSONDecodeError, ValueError):
-                        pass
-                return f"turn-{count}"
-        except Exception:
-            pass
+    if turn_count is None:
+        transcript = payload.get("transcript_path", "")
+        if transcript:
+            try:
+                p = Path(transcript)
+                if p.exists():
+                    count = 0
+                    for line in p.read_text(encoding="utf-8").splitlines():
+                        line = line.strip()
+                        if not line or '"type"' not in line:
+                            continue
+                        try:
+                            obj = json.loads(line)
+                            if isinstance(obj, dict) and obj.get("type") == "user":
+                                count += 1
+                        except (json.JSONDecodeError, ValueError):
+                            pass
+                    turn_count = count
+            except Exception as exc:
+                hook_log("transcript read failed", level="warning", error=str(exc),
+                         transcript=transcript)
+    if turn_count:
+        return f"turn-{turn_count}"
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")
 
 
@@ -393,15 +253,17 @@ def mesh_node_id() -> str | None:
 
 def handle_stop(conn: sqlite3.Connection, payload: dict, mesh_node: str | None = None) -> None:
     session_id = payload.get("session_id", "unknown")
-    turn_id = derive_turn_id(payload)
     now = datetime.now(timezone.utc).isoformat()
     cwd = payload.get("cwd")
     git_branch = get_git_branch(cwd) if cwd else None
     transcript = payload.get("transcript_path", "")
     message = payload.get("message") or {}
-    t_info = get_transcript_info(transcript) if transcript else {"model": None, "usage": {}, "stop_reason": None}
+    t_info = get_transcript_info(transcript) if transcript else {"model": None, "usage": {}, "stop_reason": None, "turn_count": 0}
+    # The transcript was parsed once above; reuse its user-message count for
+    # the turn id instead of re-reading (and re-parsing) the whole file.
+    turn_id = derive_turn_id(payload, t_info.get("turn_count"))
     model = t_info["model"] or payload.get("model") or message.get("model")
-    model_id = ensure_model_row(conn, model)
+    model_id = common.ensure_model_row(conn, model)
     usage = t_info["usage"] if transcript else (payload.get("usage") or message.get("usage") or {})
     stop_reason = t_info["stop_reason"] or payload.get("stop_reason") or message.get("stop_reason")
 
@@ -493,8 +355,8 @@ def handle_stop(conn: sqlite3.Connection, payload: dict, mesh_node: str | None =
                 "git_branch": git_branch,
                 "model_key": model,
             }))
-        except Exception:
-            pass
+        except Exception as exc:
+            hook_log("mesh emit failed (turn)", error=str(exc), session_id=session_id)
 
     conn.commit()
 
@@ -556,8 +418,8 @@ def handle_post_tool_use(conn: sqlite3.Connection, payload: dict, mesh_node: str
                 "exit_code": exit_code,
                 "error": error_text,
             }))
-        except Exception:
-            pass
+        except Exception as exc:
+            hook_log("mesh emit failed (tool_call)", error=str(exc), session_id=session_id)
 
     conn.commit()
 
@@ -573,27 +435,36 @@ def main() -> None:
     except json.JSONDecodeError:
         sys.exit(0)
 
+    conn = None
     try:
-        with sqlite3.connect(DB_PATH, timeout=5.0) as conn:
-            # WAL + a busy timeout let the hook write safely while the mesh
-            # gossip daemon (a separate process) reads/applies concurrently.
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA busy_timeout=5000")
-            init_db(conn)
-            mesh_node = mesh_node_id()
-            retention_days = get_retention_days()
-            if retention_days is not None:
-                purge_old_records(conn, retention_days)
-            if event == "stop":
-                handle_stop(conn, payload, mesh_node)
-            elif event == "post-tool-use":
-                handle_post_tool_use(conn, payload, mesh_node)
-        try:
-            ensure_dashboard_server()
-        except Exception:
-            pass
-    except Exception:
-        pass
+        # The hook fires on every turn and every tool call, so the schema is
+        # prepared exactly once per database (PRAGMA user_version stamps it)
+        # instead of re-running the full DDL + backfill on each invocation.
+        conn = sqlite3.connect(DB_PATH, timeout=5.0)
+        # WAL + a busy timeout let the hook write safely while the mesh
+        # gossip daemon (a separate process) reads/applies concurrently.
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=5000")
+        if conn.execute("PRAGMA user_version").fetchone()[0] < common.SCHEMA_USER_VERSION:
+            common.ensure_base_schema(conn)
+        mesh_node = mesh_node_id()
+        retention_days = get_retention_days()
+        if retention_days is not None:
+            purge_old_records(conn, retention_days)
+        if event == "stop":
+            handle_stop(conn, payload, mesh_node)
+        elif event == "post-tool-use":
+            handle_post_tool_use(conn, payload, mesh_node)
+        conn.commit()
+    except Exception as exc:
+        hook_log("hook failed", error=repr(exc), event=event)
+    finally:
+        if conn is not None:
+            conn.close()
+    try:
+        ensure_dashboard_server()
+    except Exception as exc:
+        hook_log("dashboard server launch failed", error=str(exc))
 
 
 if __name__ == "__main__":

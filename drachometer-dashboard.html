@@ -32,6 +32,23 @@
         --cyan: #22d3ee;
       }
 
+      /* Light mode: same variable names, swapped values. A pasted tweakcn
+         theme overrides these via inline custom properties on <html>. */
+      :root[data-theme="light"] {
+        --bg: #f4f5f7;
+        --surface: #ffffff;
+        --border: #d9dce3;
+        --text: #1b1e28;
+        --muted: #62677a;
+        --accent: #b8621f;
+        --accent2: #9a5119;
+        --green: #16803c;
+        --red: #dc2626;
+        --blue: #2563eb;
+        --purple: #7c3aed;
+        --cyan: #0e7490;
+      }
+
       * {
         margin: 0;
         padding: 0;
@@ -578,11 +595,7 @@
           5px 0 0 rgba(200, 117, 51, 0.25) !important;
       }
 
-      /* Hamburger menu */
-      .menu-wrap {
-        position: relative;
-        flex-shrink: 0;
-      }
+      /* Hamburger menu button (opens the settings modal) */
       .hamburger {
         width: 34px;
         height: 34px;
@@ -598,37 +611,6 @@
         transition: background 0.15s;
       }
       .hamburger:hover {
-        background: var(--border);
-      }
-      .menu-dropdown {
-        display: none;
-        position: absolute;
-        top: 42px;
-        left: 0;
-        min-width: 240px;
-        background: var(--surface);
-        border: 1px solid var(--border);
-        border-radius: 10px;
-        box-shadow: 0 12px 32px rgba(0, 0, 0, 0.5);
-        padding: 6px;
-        z-index: 1100;
-      }
-      .menu-dropdown.open {
-        display: block;
-      }
-      .menu-item {
-        display: block;
-        width: 100%;
-        text-align: left;
-        padding: 9px 12px;
-        border: none;
-        background: transparent;
-        color: var(--text);
-        font-size: 13px;
-        border-radius: 6px;
-        cursor: pointer;
-      }
-      .menu-item:hover {
         background: var(--border);
       }
 
@@ -802,19 +784,110 @@
       .mesh-msg.info {
         color: var(--muted);
       }
+
+      /* Settings modal tabs (Preferences / Mesh Network) */
+      .settings-tabs {
+        display: flex;
+        gap: 4px;
+        padding: 0 20px;
+        border-bottom: 1px solid var(--border);
+        flex-shrink: 0;
+      }
+      .settings-tab {
+        padding: 10px 16px;
+        border: none;
+        background: transparent;
+        color: var(--muted);
+        font-size: 13px;
+        cursor: pointer;
+        border-bottom: 2px solid transparent;
+        font-family: inherit;
+      }
+      .settings-tab:hover {
+        color: var(--text);
+      }
+      .settings-tab.active {
+        color: var(--accent);
+        border-bottom-color: var(--accent);
+        font-weight: 600;
+      }
+
+      /* Table tabs (Repositories / Folders / Sessions / Recent Turns) */
+      .table-tabs {
+        display: flex;
+        gap: 6px;
+        flex-wrap: wrap;
+        margin-bottom: 12px;
+      }
+      .table-tab {
+        padding: 5px 14px;
+        border-radius: 6px;
+        border: 1px solid var(--border);
+        background: var(--bg);
+        color: var(--muted);
+        font-size: 12px;
+        cursor: pointer;
+        transition: all 0.15s;
+        font-family: inherit;
+      }
+      .table-tab:hover {
+        border-color: var(--accent);
+        color: var(--text);
+      }
+      .table-tab.active {
+        background: var(--accent);
+        border-color: var(--accent);
+        color: #fff;
+        font-weight: 600;
+      }
+
+      /* Expandable matrix rows (Repositories / Folders) */
+      tr.row-toggle {
+        cursor: pointer;
+      }
+      tr.row-toggle:hover td {
+        background: color-mix(in srgb, var(--accent) 6%, transparent);
+      }
+      .tree-toggle {
+        display: inline-block;
+        width: 13px;
+        color: var(--muted);
+        font-size: 10px;
+      }
+      tr.branch-row td {
+        color: var(--muted);
+        background: rgba(0, 0, 0, 0.15);
+      }
+
+      .copy-btn {
+        padding: 6px 12px;
+        border-radius: 6px;
+        border: 1px solid var(--border);
+        background: var(--bg);
+        color: var(--text);
+        font-size: 12px;
+        cursor: pointer;
+        flex-shrink: 0;
+      }
+      .copy-btn:hover {
+        border-color: var(--accent);
+      }
+
+      .mesh-select {
+        padding: 7px 10px;
+        border-radius: 7px;
+        border: 1px solid var(--border);
+        background: var(--bg);
+        color: var(--text);
+        font-size: 13px;
+        font-family: inherit;
+      }
     </style>
   </head>
 
   <body>
     <header>
-      <div class="menu-wrap">
-        <button id="hamburger-btn" class="hamburger" aria-label="Open menu" aria-haspopup="true" aria-expanded="false">&#9776;</button>
-        <div id="app-menu" class="menu-dropdown" role="menu">
-          <button id="menu-mesh" class="menu-item" role="menuitem">
-            Configure Local Mesh Network
-          </button>
-        </div>
-      </div>
+      <button id="hamburger-btn" class="hamburger" aria-label="Open settings" aria-haspopup="dialog" title="Settings">&#9776;</button>
       <img src="drachometer-logo.svg" alt="Drachometer logo" class="coin-logo" />
       <h1>Drachometer</h1>
       <button
@@ -859,13 +932,17 @@
       </div>
     </div>
 
-    <div class="modal-overlay" id="mesh-modal">
+    <div class="modal-overlay" id="settings-modal">
       <div class="modal">
         <div class="modal-header">
-          <h2>Local Mesh Network</h2>
-          <button class="modal-close" id="mesh-close">&times;</button>
+          <h2>Settings</h2>
+          <button class="modal-close" id="settings-close">&times;</button>
         </div>
-        <div class="modal-body" id="mesh-body"></div>
+        <div class="settings-tabs" id="settings-tabs">
+          <button class="settings-tab active" data-settings-tab="preferences">Preferences</button>
+          <button class="settings-tab" data-settings-tab="mesh">Mesh Network</button>
+        </div>
+        <div class="modal-body" id="settings-body"></div>
       </div>
     </div>
 
@@ -942,35 +1019,31 @@
         <div class="card full">
           <span class="info-icon"
             >i<span class="info-tip"
-              >One row per Claude Code session. Cost is estimated from per-row
-              model pricing. "Uncached In" is the non-cached portion of input
-              tokens &mdash; the full input context is Uncached In + Cache Read
-              + Cache Create.</span
+              >Usage rolled up per repository (expand a row to see it broken
+              down per git branch) and per folder (expand the directory tree).
+              The other tabs show per-session and per-turn detail. Cost is
+              estimated from per-row model pricing.</span
             ></span
           >
-          <h2>Sessions</h2>
-          <div class="table-scroll" id="session-table"></div>
-        </div>
-        <div class="card full">
-          <span class="info-icon"
-            >i<span class="info-tip"
-              >The most recent 50 turns (one turn = one assistant response).
-              Each row shows the tokens billed for that API round-trip and the
-              estimated cost based on the model used.</span
-            ></span
-          >
-          <h2>Recent Turns</h2>
-          <div class="table-scroll" id="turns-table"></div>
+          <div class="table-tabs" id="table-tabs">
+            <button class="table-tab active" data-table-tab="repos">Repositories</button>
+            <button class="table-tab" data-table-tab="folders">Folders</button>
+            <button class="table-tab" data-table-tab="sessions">Sessions</button>
+            <button class="table-tab" data-table-tab="turns">Recent Turns</button>
+          </div>
+          <div class="table-scroll" id="table-container"></div>
         </div>
       </div>
     </div>
 
     <script>
-      // Offline fallback pricing (USD per 1M tokens). Overlaid at startup by
+      // Offline fallback pricing (USD per 1M tokens), matching the Python
+      // fallbacks in drachometer_common.py. Overlaid at startup by
       // loadPricing() from drachometer-pricing.json (repo-hosted, kept fresh by a GitHub Action).
       let MODEL_PRICING = {
-        opus: { input: 5, output: 25, cacheRead: 0.5, cacheCreate: 6.25 },
-        sonnet: { input: 3, output: 15, cacheRead: 0.3, cacheCreate: 3.75 },
+        fable: { input: 10, output: 50, cacheRead: 1.0, cacheCreate: 12.5 },
+        opus: { input: 4, output: 20, cacheRead: 0.4, cacheCreate: 5 },
+        sonnet: { input: 2, output: 10, cacheRead: 0.2, cacheCreate: 2.5 },
         haiku: { input: 1, output: 5, cacheRead: 0.1, cacheCreate: 1.25 },
       };
       // Used when a turn's model matches no known tier and no per-row price is stored.
@@ -982,13 +1055,18 @@
         cacheCreate: 0,
       };
 
-      const MODEL_COLORS = {
-        fable: "#a78bfa",
-        opus: "#c87533",
-        sonnet: "#60a5fa",
-        haiku: "#4ade80",
-        unknown: "#8b8fa3",
-      };
+      // Model-tier colors resolve through the CSS variables at draw time so
+      // light mode and pasted tweakcn themes restyle the charts too.
+      function modelColor(tier) {
+        const vars = {
+          fable: "--purple",
+          opus: "--accent",
+          sonnet: "--blue",
+          haiku: "--green",
+          unknown: "--muted",
+        };
+        return cssVar(vars[tier] || "--muted", "#8b8fa3");
+      }
 
       function modelTier(model) {
         if (!model) return "unknown";
@@ -1227,9 +1305,16 @@
       }
 
       // --- Multi-sort state ---
-      const sortState = { sessions: [], turns: [] };
+      const sortState = { sessions: [], turns: [], repos: [{ key: "_cost", dir: "desc" }], folders: [{ key: "_cost", dir: "desc" }] };
       let lastSessionData = [],
-        lastTurnData = [];
+        lastTurnData = [],
+        lastAllTurns = [];
+
+      // --- Table tabs (Repositories / Folders / Sessions / Recent Turns) ---
+      let activeTableTab = "repos";
+      // Expansion state per visual. Folders starts as null and is seeded with
+      // the root-level items (expanded by one level) the first time it renders.
+      const expandState = { repos: new Set(), folders: null };
 
       // Columns whose raw values are numeric (sort by number, not string)
       const NUMERIC_KEYS = new Set([
@@ -1303,15 +1388,184 @@
         renderFn();
       }
 
+      function tableContainer() {
+        return document.getElementById("table-container");
+      }
+
+      function tableHeaderRow(cols, sorts) {
+        return `<tr>${cols
+          .map(
+            (c) =>
+              `<th class="${c.cls} sortable" data-sort-key="${c.key}">${c.label}${sortIndicator(sorts, c.key)}</th>`,
+          )
+          .join("")}</tr>`;
+      }
+
+      function usageCells(row) {
+        return `
+      <td class="right">${row.turns ?? ""}</td>
+      <td class="right">${fmt(row.input_tokens)}</td>
+      <td class="right">${fmt(row.output_tokens)}</td>
+      <td class="right">${fmt(row.cache_read_tokens)}</td>
+      <td class="right">${fmt(row.cache_creation_tokens)}</td>
+      <td class="right cost">${usd(row._cost)}</td>`;
+      }
+
+      const matrixColumns = () => [
+        { key: "name", label: "Name", cls: "mono" },
+        { key: "turns", label: "Turns", cls: "right" },
+        { key: "input_tokens", label: "Uncached In", cls: "right" },
+        { key: "output_tokens", label: "Output", cls: "right" },
+        { key: "cache_read_tokens", label: "Cache Read", cls: "right" },
+        { key: "cache_creation_tokens", label: "Cache Create", cls: "right" },
+        { key: "_cost", label: "Est. Cost", cls: "right" },
+      ];
+
+      // --- Repositories matrix: usage rolled up per repo, expandable to branches ---
+      function normPath(p) {
+        return (p || "").replace(/\\/g, "/").replace(/\/+$/, "");
+      }
+
+      function blankAgg() {
+        return {
+          turns: 0,
+          input_tokens: 0,
+          output_tokens: 0,
+          cache_read_tokens: 0,
+          cache_creation_tokens: 0,
+          _cost: 0,
+        };
+      }
+
+      function addTurn(agg, r) {
+        agg.turns += 1;
+        agg.input_tokens += r.input_tokens || 0;
+        agg.output_tokens += r.output_tokens || 0;
+        agg.cache_read_tokens += r.cache_read_tokens || 0;
+        agg.cache_creation_tokens += r.cache_creation_tokens || 0;
+        agg._cost += costOf(r);
+      }
+
+      function computeRepoRows(turnRows) {
+        const byRepo = {};
+        turnRows.forEach((r) => {
+          const key = normPath(r.cwd);
+          const repoKey = key || "(no directory)";
+          const g = (byRepo[repoKey] ||= {
+            key: repoKey,
+            name: key ? key.split("/").filter(Boolean).pop() : "(no directory)",
+            branches: {},
+            ...blankAgg(),
+          });
+          addTurn(g, r);
+          const branchKey = r.git_branch || "(no branch)";
+          const b = (g.branches[branchKey] ||= { name: branchKey, ...blankAgg() });
+          addTurn(b, r);
+        });
+        return Object.values(byRepo).map((g) => ({
+          ...g,
+          branchList: Object.values(g.branches).sort((a, b) => b._cost - a._cost),
+        }));
+      }
+
+      function renderRepoTable() {
+        const cols = matrixColumns();
+        const sorted = applySorts(computeRepoRows(lastAllTurns), sortState.repos);
+        const rows = sorted
+          .map((repo) => {
+            const open = expandState.repos.has(repo.key);
+            let html = `<tr class="row-toggle" data-repo-key="${esc(repo.key)}" title="${esc(repo.key)}">
+      <td class="mono"><span class="tree-toggle">${repo.branchList.length ? (open ? "▼" : "▶") : ""}</span>${esc(repo.name)}</td>
+      ${usageCells(repo)}
+    </tr>`;
+            if (open) {
+              html += repo.branchList
+                .map(
+                  (b) => `<tr class="branch-row">
+      <td class="mono" style="padding-left:30px">${esc(b.name)}</td>
+      ${usageCells(b)}
+    </tr>`,
+                )
+                .join("");
+            }
+            return html;
+          })
+          .join("");
+        tableContainer().innerHTML = `<table>
+    ${tableHeaderRow(cols, sortState.repos)}
+    ${rows || '<tr><td colspan="7" style="color:var(--muted)">No turns in the selected date range.</td></tr>'}
+  </table>`;
+      }
+
+      // --- Folders matrix: cwd hierarchy, expandable, root expanded one level ---
+      function buildFolderTree(turnRows) {
+        const root = { name: "", path: "", depth: -1, children: new Map(), ...blankAgg() };
+        turnRows.forEach((r) => {
+          const p = normPath(r.cwd);
+          if (!p) return;
+          const parts = p.split("/").filter(Boolean);
+          let node = root;
+          let acc = p.startsWith("/") ? "/" : "";
+          parts.forEach((part, i) => {
+            acc = acc === "/" ? "/" + part : acc ? acc + "/" + part : part;
+            if (!node.children.has(part)) {
+              node.children.set(part, {
+                name: part,
+                path: acc,
+                depth: i,
+                children: new Map(),
+                ...blankAgg(),
+              });
+            }
+            node = node.children.get(part);
+            addTurn(node, r); // every ancestor rolls up its subtree
+          });
+        });
+        return root;
+      }
+
+      function folderTreeToRows(root) {
+        // "Root expanded by 1 level": seed expansion with the top-level items
+        // so their immediate children are visible on first render.
+        if (expandState.folders === null) {
+          expandState.folders = new Set(
+            [...root.children.values()].map((c) => c.path),
+          );
+        }
+        const out = [];
+        const walk = (node) => {
+          const children = applySorts([...node.children.values()], sortState.folders);
+          children.forEach((child) => {
+            out.push({ ...child, hasChildren: child.children.size > 0 });
+            if (child.children.size && expandState.folders.has(child.path)) walk(child);
+          });
+        };
+        walk(root);
+        return out;
+      }
+
+      function renderFolderTable() {
+        const cols = matrixColumns();
+        const rows = folderTreeToRows(buildFolderTree(lastAllTurns))
+          .map(
+            (f) => `<tr class="${f.hasChildren ? "row-toggle" : ""}" data-folder-key="${esc(f.path)}" title="${esc(f.path)}">
+      <td class="mono" style="padding-left:${10 + f.depth * 16}px"><span class="tree-toggle">${f.hasChildren ? (expandState.folders.has(f.path) ? "▼" : "▶") : ""}</span>${esc(f.name)}</td>
+      ${usageCells(f)}
+    </tr>`,
+          )
+          .join("");
+        tableContainer().innerHTML = `<table>
+    ${tableHeaderRow(cols, sortState.folders)}
+    ${rows || '<tr><td colspan="7" style="color:var(--muted)">No directory data in the selected date range.</td></tr>'}
+  </table>`;
+      }
+
       function renderSessionTable() {
         const sorted = applySorts(lastSessionData, sortState.sessions);
         const cols = sessionColumns();
-        const container = document.getElementById("session-table");
-        container.innerHTML = `<table>
-    <tr>${cols.map((c) => `<th class="${c.cls} sortable" data-sort-key="${c.key}">${c.label}${sortIndicator(sortState.sessions, c.key)}</th>`).join("")}</tr>
-    ${sorted
-      .map(
-        (s) => `<tr>
+        const rows = sorted
+          .map(
+            (s) => `<tr>
       <td class="mono">${s.session_id.slice(0, 12)}...</td>
       <td class="mono">${esc(shortModel(s.model))}</td>
       <td class="mono" title="${esc(s.cwd)}">${shortPath(s.cwd)}</td>
@@ -1324,14 +1578,12 @@
       <td class="right">${fmt(s.cache_creation_tokens)}</td>
       <td class="right cost">${usd(s._cost)}</td>
     </tr>`,
-      )
-      .join("")}
+          )
+          .join("");
+        tableContainer().innerHTML = `<table>
+    ${tableHeaderRow(cols, sortState.sessions)}
+    ${rows}
   </table>`;
-        container
-          .querySelector("tr")
-          .addEventListener("click", (e) =>
-            handleHeaderClick(e, "sessions", cols, renderSessionTable),
-          );
       }
 
       function sessionColumns() {
@@ -1353,12 +1605,9 @@
       function renderTurnsTable() {
         const sorted = applySorts(lastTurnData, sortState.turns);
         const cols = turnsColumns();
-        const container = document.getElementById("turns-table");
-        container.innerHTML = `<table>
-    <tr>${cols.map((c) => `<th class="${c.cls} sortable" data-sort-key="${c.key}">${c.label}${sortIndicator(sortState.turns, c.key)}</th>`).join("")}</tr>
-    ${sorted
-      .map(
-        (t) => `<tr>
+        const rows = sorted
+          .map(
+            (t) => `<tr>
       <td class="mono">${localDateTime(t.recorded_at)}</td>
       <td class="mono">${esc(shortModel(t.model))}</td>
       <td class="mono" title="${esc(t.cwd)}">${shortPath(t.cwd)}</td>
@@ -1371,14 +1620,12 @@
       <td class="right">${t.tool_calls || 0}</td>
       <td class="right cost">${usd(costOf(t))}</td>
     </tr>`,
-      )
-      .join("")}
+          )
+          .join("");
+        tableContainer().innerHTML = `<table>
+    ${tableHeaderRow(cols, sortState.turns)}
+    ${rows}
   </table>`;
-        container
-          .querySelector("tr")
-          .addEventListener("click", (e) =>
-            handleHeaderClick(e, "turns", cols, renderTurnsTable),
-          );
       }
 
       function turnsColumns() {
@@ -1397,9 +1644,110 @@
         ];
       }
 
+      function cssVar(name, fallback) {
+        const value = getComputedStyle(document.documentElement)
+          .getPropertyValue(name)
+          .trim();
+        return value || fallback;
+      }
+
+      // Translucent version of any CSS color (works with hex, oklch, vars
+      // resolved to arbitrary tweakcn formats). Canvas supports color-mix()
+      // in modern browsers.
+      function withAlpha(color, pct) {
+        return `color-mix(in srgb, ${color} ${pct}%, transparent)`;
+      }
+
+      // --- Color-theory palette derivation (custom themes) -----------------
+      // Rather than applying a tweakcn theme's own chart colors, the theme's
+      // primary is used for the largest datapoint in each visual and the
+      // remaining datapoints take harmonies of it (analogous, triadic,
+      // complementary), assigned in descending order of magnitude.
+
+      let _colorProbe = null;
+      // Resolve ANY css color (hex, oklch, hsl, ...) to sRGB via a 1x1 canvas.
+      function cssColorToRgb(color) {
+        if (!_colorProbe) _colorProbe = document.createElement("canvas");
+        const ctx = _colorProbe.getContext("2d", { willReadFrequently: true });
+        ctx.fillStyle = "#ff00ff"; // sentinel: invalid colors leave this set
+        ctx.fillStyle = color;
+        ctx.fillRect(0, 0, 1, 1);
+        const d = ctx.getImageData(0, 0, 1, 1).data;
+        return [d[0], d[1], d[2]];
+      }
+
+      function rgbToHsl(r, g, b) {
+        const rn = r / 255, gn = g / 255, bn = b / 255;
+        const max = Math.max(rn, gn, bn), min = Math.min(rn, gn, bn);
+        const l = (max + min) / 2;
+        if (max === min) return [0, 0, l];
+        const d = max - min;
+        const s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+        let h;
+        if (max === rn) h = ((gn - bn) / d + (gn < bn ? 6 : 0)) / 6;
+        else if (max === gn) h = ((bn - rn) / d + 2) / 6;
+        else h = ((rn - gn) / d + 4) / 6;
+        return [h * 360, s, l];
+      }
+
+      function chartPrimary() {
+        return cssVar("--accent", "#c87533");
+      }
+
+      // The dashboard's own accent palette, snapshotted at startup (before any
+      // theme can overwrite the variables) so a near-neutral theme primary can
+      // still fall back to recognizable default colors.
+      const FALLBACK_ACCENTS = ["--blue", "--green", "--purple", "--cyan", "--red"]
+        .map((name) => ({
+          name,
+          value:
+            getComputedStyle(document.documentElement).getPropertyValue(name).trim() ||
+            "#8b8fa3",
+        }));
+
+      // Hue offsets from the primary, ordered so that as datapoints shrink
+      // their colors drift from analogous to triadic to complementary --
+      // close hues for the big series, punchier contrast for the small ones.
+      const HARMONY_OFFSETS = [0, 30, -30, 120, -120, 180, 150, -150, 240, 60, -60, -240];
+
+      function buildHarmonyPalette(count) {
+        const primary = chartPrimary();
+        const [h, s, l] = rgbToHsl(...cssColorToRgb(primary));
+        // A near-neutral primary gives harmonies nothing to work with; keep
+        // it for the largest datapoint and fall back to the dashboard's own
+        // accent palette for the rest.
+        if (s < 0.08) {
+          const out = [primary];
+          for (let i = 1; i < count; i++) {
+            out.push(FALLBACK_ACCENTS[(i - 1) % FALLBACK_ACCENTS.length].value);
+          }
+          return out;
+        }
+        // Harmonies keep the primary's character but stay readable on both
+        // light and dark surfaces.
+        const sat = Math.min(0.85, Math.max(0.55, s));
+        const light = Math.min(0.62, Math.max(0.42, l));
+        const out = [primary]; // the primary itself is used verbatim
+        for (let i = 1; i < count; i++) {
+          const hue = (h + HARMONY_OFFSETS[i % HARMONY_OFFSETS.length] + 360) % 360;
+          out.push(
+            `hsl(${hue.toFixed(1)} ${(sat * 100).toFixed(1)}% ${(light * 100).toFixed(1)}%)`,
+          );
+        }
+        return out;
+      }
+
+      // Colors for a visual's datapoints: the theme's primary first, then
+      // harmonies of it. Callers pass items in their on-axis/legend display
+      // order, which is what determines which datapoint gets which color.
+      // (Top Tools: value-sorted axis. Cost by Day: alphabetical legend.
+      // Waterfall: fixed category axis order.)
+
       function chartDefaults() {
-        Chart.defaults.color = "#8b8fa3";
-        Chart.defaults.borderColor = "#2a2d3a";
+        // Read from CSS variables so light mode and pasted tweakcn themes
+        // restyle the charts along with everything else.
+        Chart.defaults.color = cssVar("--muted", "#8b8fa3");
+        Chart.defaults.borderColor = cssVar("--border", "#2a2d3a");
         Chart.defaults.font.family =
           "-apple-system, BlinkMacSystemFont, Segoe UI, system-ui, sans-serif";
         Chart.defaults.font.size = 11;
@@ -1504,7 +1852,7 @@
         // Opus and Sonnet is costed correctly, not at one model's rate for all tokens).
         const allTurns = query(`
     SELECT t.session_id, t.input_tokens, t.output_tokens, t.cache_read_tokens,
-           t.cache_creation_tokens,
+           t.cache_creation_tokens, t.cwd, t.git_branch,
            COALESCE(m.model_key, t.model) as model,
            m.input_price_per_mtok, m.output_price_per_mtok,
            m.cache_read_price_per_mtok, m.cache_creation_price_per_mtok
@@ -1660,28 +2008,37 @@
           {
             label: "Uncached Input",
             val: totInput,
-            color: "#c87533",
+            color: cssVar("--accent", "#c87533"),
             tokens: wfTokens.input,
           },
           {
             label: "Output",
             val: totOutput,
-            color: "#60a5fa",
+            color: cssVar("--blue", "#60a5fa"),
             tokens: wfTokens.output,
           },
           {
             label: "Cache Read",
             val: totCacheRead,
-            color: "#4ade80",
+            color: cssVar("--green", "#4ade80"),
             tokens: wfTokens.cacheRead,
           },
           {
             label: "Cache Create",
             val: totCacheCreate,
-            color: "#a78bfa",
+            color: cssVar("--purple", "#a78bfa"),
             tokens: wfTokens.cacheCreate,
           },
         ];
+        // Under a custom theme, colors follow the waterfall's fixed x-axis
+        // order (Uncached Input, Output, Cache Read, Cache Create), starting
+        // with the theme's primary.
+        if (customThemeActive) {
+          const palette = buildHarmonyPalette(wfSteps.length);
+          wfSteps.forEach((s, i) => {
+            s.color = palette[i];
+          });
+        }
         const wfLabels = wfSteps.map((s) => s.label).concat("Total");
         const wfData = [];
         const wfColors = [];
@@ -1692,7 +2049,7 @@
           running += s.val;
         });
         wfData.push([0, running]);
-        wfColors.push("#e2e4ea");
+        wfColors.push(cssVar("--text", "#e2e4ea"));
 
         const connectorData = wfData.map((bar, i) =>
           i < wfData.length - 1 ? bar[1] : null,
@@ -1712,7 +2069,7 @@
               {
                 type: "line",
                 data: connectorData,
-                borderColor: "#555",
+                borderColor: cssVar("--border", "#555"),
                 borderWidth: 1,
                 borderDash: [3, 3],
                 pointRadius: 0,
@@ -1766,7 +2123,7 @@
                 ctx2.font =
                   "11px -apple-system, BlinkMacSystemFont, Segoe UI, system-ui, sans-serif";
                 ctx2.textAlign = "center";
-                ctx2.fillStyle = "#e2e4ea";
+                ctx2.fillStyle = cssVar("--text", "#e2e4ea");
                 meta.data.forEach((bar, i) => {
                   const v = wfData[i];
                   const val = v[1] - v[0];
@@ -1781,9 +2138,11 @@
 
         // Cost over time (line chart per model) — by hour when single day, by day otherwise
         const timeBuckets = [...new Set(dailyRows.map((d) => d.bucket))].sort();
+        // Legend order is alphabetical so it's predictable; harmony colors
+        // (custom themes) follow this same order.
         const modelTiers = [
           ...new Set(dailyRows.map((d) => modelTier(d.model))),
-        ];
+        ].sort();
 
         const costByBucketModel = {};
         const tokensByBucketModel = {};
@@ -1810,6 +2169,18 @@
         document.getElementById("label-cost").textContent = singleDay
           ? "Cost by Hour"
           : "Cost by Day";
+        // Model-tier colors: default (per-tier) palette, or — under a custom
+        // theme — harmonies of the theme's primary assigned in the legend's
+        // alphabetical order (first tier name gets the primary).
+        let tierColor = modelColor;
+        if (customThemeActive) {
+          const palette = buildHarmonyPalette(modelTiers.length);
+          const byTier = {};
+          modelTiers.forEach((tier, i) => {
+            byTier[tier] = palette[i];
+          });
+          tierColor = (tier) => byTier[tier];
+        }
         charts.cost = new Chart(document.getElementById("chart-cost"), {
           type: "line",
           data: {
@@ -1819,9 +2190,8 @@
               data: timeBuckets.map(
                 (b) => (costByBucketModel[tier] || {})[b] || 0,
               ),
-              borderColor: MODEL_COLORS[tier] || MODEL_COLORS.unknown,
-              backgroundColor:
-                (MODEL_COLORS[tier] || MODEL_COLORS.unknown) + "18",
+              borderColor: tierColor(tier),
+              backgroundColor: withAlpha(tierColor(tier), 10),
               fill: true,
               tension: 0.3,
               pointRadius: 3,
@@ -1919,26 +2289,36 @@
           return { ...tc, ...agg };
         });
 
-        const toolColors = tools.map((_, i) => {
-          const palette = [
-            "#c87533",
-            "#60a5fa",
-            "#4ade80",
-            "#a78bfa",
-            "#22d3ee",
-            "#f87171",
-            "#facc15",
-            "#f472b6",
-            "#34d399",
-            "#fb923c",
-            "#818cf8",
-            "#a3e635",
-            "#e879f9",
-            "#38bdf8",
-            "#fbbf24",
-          ];
-          return palette[i % palette.length];
-        });
+        // Chart series colors: under a custom theme the palette follows the
+        // y-axis display order (tools arrive sorted by call count, so the
+        // most-used tool takes the theme's primary); otherwise the
+        // CSS-variable palette.
+        const toolColors = customThemeActive
+          ? buildHarmonyPalette(tools.length)
+          : tools.map((_, i) => {
+              const vars = [
+                "--accent",
+                "--blue",
+                "--green",
+                "--purple",
+                "--cyan",
+                "--red",
+              ];
+              const palette = [
+                "#facc15",
+                "#f472b6",
+                "#34d399",
+                "#fb923c",
+                "#818cf8",
+                "#a3e635",
+                "#e879f9",
+                "#38bdf8",
+                "#fbbf24",
+              ];
+              return i < vars.length
+                ? cssVar(vars[i], "#8b8fa3")
+                : palette[(i - vars.length) % palette.length];
+            });
 
         charts.tools = new Chart(document.getElementById("chart-tools"), {
           type: "bar",
@@ -2003,8 +2383,15 @@
               {
                 label: "Cache Hit %",
                 data: cacheDaily.map((d) => d.pct),
-                borderColor: "#22d3ee",
-                backgroundColor: "rgba(34,211,238,.1)",
+                borderColor: customThemeActive
+                  ? chartPrimary()
+                  : cssVar("--cyan", "#22d3ee"),
+                backgroundColor: withAlpha(
+                  customThemeActive
+                    ? chartPrimary()
+                    : cssVar("--cyan", "#22d3ee"),
+                  10,
+                ),
                 fill: true,
                 tension: 0.3,
                 pointRadius: 3,
@@ -2064,8 +2451,66 @@
     GROUP BY t.id ORDER BY t.recorded_at DESC LIMIT 50`);
         turns.forEach((t) => (t._cost = costOf(t)));
         lastTurnData = turns;
-        renderTurnsTable();
+        lastAllTurns = allTurns;
+        renderActiveTable();
       }
+
+      function renderActiveTable() {
+        if (activeTableTab === "repos") renderRepoTable();
+        else if (activeTableTab === "folders") renderFolderTable();
+        else if (activeTableTab === "sessions") renderSessionTable();
+        else renderTurnsTable();
+      }
+
+      // One delegated listener serves all four table tabs: header clicks sort,
+      // matrix row clicks expand/collapse.
+      tableContainer().addEventListener("click", (e) => {
+        const th = e.target.closest("th.sortable");
+        if (th) {
+          const renderers = {
+            repos: renderRepoTable,
+            folders: renderFolderTable,
+            sessions: renderSessionTable,
+            turns: renderTurnsTable,
+          };
+          handleHeaderClick(e, activeTableTab, null, renderers[activeTableTab]);
+          return;
+        }
+        const repoRow = e.target.closest("tr[data-repo-key]");
+        if (repoRow) {
+          const key = repoRow.dataset.repoKey;
+          if (expandState.repos.has(key)) expandState.repos.delete(key);
+          else expandState.repos.add(key);
+          renderRepoTable();
+          return;
+        }
+        const folderRow = e.target.closest("tr[data-folder-key]");
+        if (folderRow) {
+          const key = folderRow.dataset.folderKey;
+          if (expandState.folders.has(key)) expandState.folders.delete(key);
+          else expandState.folders.add(key);
+          renderFolderTable();
+        }
+      });
+
+      // Remember the active table tab across reloads.
+      const savedTableTab = localStorage.getItem("ctud_table_tab");
+      if (savedTableTab && ["repos", "folders", "sessions", "turns"].includes(savedTableTab)) {
+        activeTableTab = savedTableTab;
+      }
+      document
+        .querySelectorAll("#table-tabs .table-tab")
+        .forEach((b) => b.classList.toggle("active", b.dataset.tableTab === activeTableTab));
+      document.getElementById("table-tabs").addEventListener("click", (e) => {
+        const btn = e.target.closest("button[data-table-tab]");
+        if (!btn) return;
+        activeTableTab = btn.dataset.tableTab;
+        localStorage.setItem("ctud_table_tab", activeTableTab);
+        document
+          .querySelectorAll("#table-tabs .table-tab")
+          .forEach((b) => b.classList.toggle("active", b === btn));
+        renderActiveTable();
+      });
 
       async function loadDb(arrayBuffer) {
         if (!sqlJs)
@@ -2076,7 +2521,8 @@
         if (DB) DB.close();
         DB = new sqlJs.Database(new Uint8Array(arrayBuffer));
         ensureDbSchema();
-        await loadPricing();
+        await Promise.all([loadPricing(), applyTheme()]);
+        lastRenderAt = Date.now(); // first paint counts as a render
         document.getElementById("drop-zone").style.display = "none";
         document.getElementById("dashboard").style.display = "block";
         render();
@@ -2349,12 +2795,37 @@
       function connectSSE() {
         const es = new EventSource("/events");
         es.onmessage = () => {
-          if (DB) reloadDb();
+          if (DB) scheduleRender();
         };
         es.onerror = () => {
           es.close();
           setTimeout(connectSSE, 5000);
         };
+      }
+
+      // Re-render at most once per 5-second window, no matter how many SSE
+      // refresh pings arrive. The hook writes on every tool call and turn, so
+      // pings arrive in bursts while a session is active; re-rendering per
+      // ping used to make every visual destroy/recreate itself repeatedly on
+      // cold start ("twitching") before settling.
+      const RENDER_MIN_INTERVAL = 5000;
+      let lastRenderAt = 0;
+      let pendingRender = false;
+
+      function scheduleRender() {
+        const wait = RENDER_MIN_INTERVAL - (Date.now() - lastRenderAt);
+        if (wait <= 0) {
+          lastRenderAt = Date.now();
+          reloadDb();
+          return;
+        }
+        if (pendingRender) return;
+        pendingRender = true;
+        setTimeout(() => {
+          pendingRender = false;
+          lastRenderAt = Date.now();
+          reloadDb();
+        }, wait);
       }
 
       // --- README modal ---
@@ -2494,33 +2965,72 @@
           readmeModal.classList.remove("open");
       });
 
-      // --- Hamburger menu + Local Mesh Network configuration ---
-      const appMenu = document.getElementById("app-menu");
+      // --- Settings modal (Preferences + Mesh Network tabs) ---
       const hamburgerBtn = document.getElementById("hamburger-btn");
-      const meshModal = document.getElementById("mesh-modal");
-      const meshBody = document.getElementById("mesh-body");
+      const settingsModal = document.getElementById("settings-modal");
+      const settingsBody = document.getElementById("settings-body");
       const meshIndicator = document.getElementById("mesh-indicator");
 
-      let meshUI = { status: null, scan: null, scanning: false, message: null, busy: false };
+      let settingsTab = "preferences";
+      let meshUI = { status: null, scan: null, scanning: false, message: null, busy: false, interfaces: null };
+      let prefsUI = { prefs: null, message: null };
 
-      function closeMenu() {
-        appMenu.classList.remove("open");
-        hamburgerBtn.setAttribute("aria-expanded", "false");
-      }
-      hamburgerBtn.addEventListener("click", (e) => {
-        e.stopPropagation();
-        const open = appMenu.classList.toggle("open");
-        hamburgerBtn.setAttribute("aria-expanded", String(open));
-      });
-      document.addEventListener("click", (e) => {
-        if (!appMenu.contains(e.target) && e.target !== hamburgerBtn) closeMenu();
-      });
-      document
-        .getElementById("menu-mesh")
-        .addEventListener("click", () => {
-          closeMenu();
-          openMeshModal();
+      hamburgerBtn.addEventListener("click", () => openSettingsModal("preferences"));
+      meshIndicator.addEventListener("click", () => openSettingsModal("mesh"));
+
+      function setSettingsTab(tab) {
+        settingsTab = tab;
+        document.querySelectorAll("#settings-tabs .settings-tab").forEach((b) => {
+          b.classList.toggle("active", b.dataset.settingsTab === tab);
         });
+      }
+
+      async function openSettingsModal(tab) {
+        setSettingsTab(tab);
+        settingsModal.classList.add("open");
+        settingsBody.innerHTML = '<p class="mesh-msg info">Loading…</p>';
+        if (tab === "mesh") {
+          meshUI.message = null;
+          meshUI.status = await meshFetchStatus();
+          renderSettingsBody();
+          // Kick off a subnet scan and interface listing (both may take a moment).
+          meshUI.scanning = true;
+          renderSettingsBody();
+          const [scan, interfaces] = await Promise.all([meshScan(), fetchInterfaces()]);
+          meshUI.scan = scan;
+          meshUI.interfaces = interfaces;
+          meshUI.scanning = false;
+          renderSettingsBody();
+        } else {
+          prefsUI.message = null;
+          prefsUI.prefs = await fetchPreferences();
+          renderSettingsBody();
+        }
+      }
+
+      function closeSettingsModal() {
+        settingsModal.classList.remove("open");
+      }
+      document
+        .getElementById("settings-close")
+        .addEventListener("click", closeSettingsModal);
+      settingsModal.addEventListener("click", (e) => {
+        if (e.target === settingsModal) closeSettingsModal();
+      });
+      document.addEventListener("keydown", (e) => {
+        if (e.key === "Escape" && settingsModal.classList.contains("open"))
+          closeSettingsModal();
+      });
+      document.getElementById("settings-tabs").addEventListener("click", (e) => {
+        const btn = e.target.closest("button[data-settings-tab]");
+        if (!btn) return;
+        openSettingsModal(btn.dataset.settingsTab);
+      });
+
+      function renderSettingsBody() {
+        if (settingsTab === "mesh") renderMeshBody();
+        else renderPreferencesBody();
+      }
 
       function meshFmtDuration(s) {
         if (s === null || s === undefined) return "\u2014";
@@ -2595,44 +3105,257 @@
         peers.textContent = `${n} peer${n === 1 ? "" : "s"} connected`;
       }
 
-      meshIndicator.addEventListener("click", openMeshModal);
+      // --- Theme (dark/light mode + tweakcn themes) ---
+      const THEME_MODE_KEY = "ctud_theme_mode"; // "dark" | "light"
+      const THEME_URL_KEY = "ctud_theme_url";   // tweakcn link or slug
+      const TWEAKCN_COMMUNITY_URL = "https://tweakcn.com/themes/community";
+      let customThemeActive = false;
+      let themeLoadedFor = null; // slug the custom theme was last fetched for
+      let themeLoadedName = null; // display name of the applied theme
 
-      async function openMeshModal() {
-        meshModal.classList.add("open");
-        meshUI.message = null;
-        meshUI.status = await meshFetchStatus();
-        renderMeshBody();
-        // Kick off a subnet scan (may take a moment).
-        meshUI.scanning = true;
-        renderMeshBody();
-        meshUI.scan = await meshScan();
-        meshUI.scanning = false;
-        renderMeshBody();
+      // shadcn/tweakcn variable names mapped onto this dashboard's UI chrome
+      // (background, text, buttons, links). Chart *datapoint* colors are NOT
+      // taken from the theme directly -- they are derived from the theme's
+      // primary via color harmonies (see buildHarmonyPalette below).
+      const THEME_VAR_MAP = [
+        ["background", "--bg"],
+        ["foreground", "--text"],
+        ["card", "--surface"],
+        ["border", "--border"],
+        ["muted-foreground", "--muted"],
+        ["primary", "--accent"],
+        ["accent", "--accent2"],
+        ["destructive", "--red"],
+        ["chart-1", "--blue"],
+        ["chart-2", "--green"],
+        ["chart-3", "--purple"],
+        ["chart-4", "--cyan"],
+      ];
+
+      function parseTweakcnInput(text) {
+        const raw = (text || "").trim();
+        if (!raw) return null;
+        const match = raw.match(
+          /tweakcn\.com\/(?:r\/themes|editor\/theme|themes)\/([A-Za-z0-9][A-Za-z0-9-]*)/,
+        );
+        if (match) return match[1];
+        // A bare theme slug (e.g. "neo-brutalism") also works.
+        if (/^[A-Za-z0-9][A-Za-z0-9-]*$/.test(raw)) return raw;
+        return null;
       }
 
-      function meshCloseModal() {
-        meshModal.classList.remove("open");
+      function setThemeMode(mode) {
+        document.documentElement.dataset.theme = mode === "light" ? "light" : "dark";
       }
-      document
-        .getElementById("mesh-close")
-        .addEventListener("click", meshCloseModal);
-      meshModal.addEventListener("click", (e) => {
-        if (e.target === meshModal) meshCloseModal();
-      });
-      document.addEventListener("keydown", (e) => {
-        if (e.key === "Escape" && meshModal.classList.contains("open"))
-          meshCloseModal();
-      });
+
+      async function loadTweakcnTheme(input) {
+        const slug = parseTweakcnInput(input);
+        if (!slug) throw new Error("That doesn't look like a tweakcn theme link or slug.");
+        if (themeLoadedFor === slug && customThemeActive) return themeLoadedName;
+        const resp = await fetch(`https://tweakcn.com/r/themes/${encodeURIComponent(slug)}.json`, {
+          cache: "no-store",
+        });
+        if (!resp.ok) throw new Error(`tweakcn returned HTTP ${resp.status} for "${slug}".`);
+        const data = await resp.json();
+        const vars = data && data.cssVars && (data.cssVars.dark || data.cssVars.light);
+        if (!vars) throw new Error(`Theme "${slug}" has no CSS variables to apply.`);
+        const root = document.documentElement;
+        THEME_VAR_MAP.forEach(([from, to]) => {
+          if (vars[from]) root.style.setProperty(to, vars[from]);
+        });
+        customThemeActive = true;
+        themeLoadedFor = slug;
+        themeLoadedName = data.name || slug;
+        return themeLoadedName;
+      }
+
+      function clearCustomTheme() {
+        THEME_VAR_MAP.forEach(([, to]) =>
+          document.documentElement.style.removeProperty(to),
+        );
+        customThemeActive = false;
+        themeLoadedFor = null;
+        themeLoadedName = null;
+      }
+
+      // Applies the persisted theme at startup (and after prefs edits):
+      // the tweakcn theme wins over the dark/light toggle when one is saved.
+      async function applyTheme() {
+        const savedUrl = localStorage.getItem(THEME_URL_KEY) || "";
+        if (savedUrl) {
+          try {
+            const name = await loadTweakcnTheme(savedUrl);
+            setThemeMode("dark"); // palette comes entirely from the theme
+            return { applied: true, name };
+          } catch {
+            clearCustomTheme(); // fall back to the saved mode below
+          }
+        } else {
+          clearCustomTheme();
+        }
+        themeLoadedName = null;
+        setThemeMode(localStorage.getItem(THEME_MODE_KEY) || "dark");
+        return { applied: false };
+      }
+
+      // Re-paint everything that reads colors at draw time (charts). Tables
+      // and KPIs restyle themselves through CSS variables.
+      function repaintAfterThemeChange() {
+        if (DB) render();
+      }
+
+
+      async function fetchPreferences() {
+        try {
+          const resp = await fetch("/api/preferences", { cache: "no-store" });
+          if (!resp.ok) return null;
+          return await resp.json();
+        } catch {
+          return null;
+        }
+      }
+
+      function renderPreferencesBody() {
+        if (!prefsUI.prefs) {
+          settingsBody.innerHTML =
+            '<p class="mesh-msg info">Preferences are only available when the dashboard is served by the local Drachometer server (http://localhost:9873).</p>';
+          return;
+        }
+        const days = prefsUI.prefs.token_usage_retention_days;
+        const savedMode = localStorage.getItem(THEME_MODE_KEY) || "dark";
+        const savedUrl = localStorage.getItem(THEME_URL_KEY) || "";
+        const modeDisabled = customThemeActive ? "disabled" : "";
+        settingsBody.innerHTML = `
+        <div class="mesh-section">
+          <h2>Theme</h2>
+          <div class="mesh-row" style="align-items:center">
+            <button class="table-tab" data-mode="dark"${modeDisabled}>Dark</button>
+            <button class="table-tab" data-mode="light"${modeDisabled}>Light</button>
+            <span class="mesh-msg info">${
+              customThemeActive
+                ? `Custom theme active${themeLoadedName ? `: ${esc(themeLoadedName)}` : ""} — the Dark/Light toggle is disabled.`
+                : ""
+            }</span>
+          </div>
+          <div class="mesh-row">
+            <input class="mesh-input" id="theme-url-input" style="flex:1;min-width:260px"
+              placeholder="Paste a tweakcn theme link (or theme slug)" value="${esc(savedUrl)}" />
+            <button class="mesh-btn" id="theme-apply-btn">Apply</button>
+            ${savedUrl ? '<button class="mesh-btn secondary" id="theme-clear-btn">Clear</button>' : ""}
+          </div>
+          <p class="mesh-msg info">Browse community themes at
+            <a href="${TWEAKCN_COMMUNITY_URL}" target="_blank" rel="noopener noreferrer" style="color:var(--accent)">tweakcn.com/themes/community</a> —
+            open any theme, copy its link, and paste it here. A theme recolors the app around its primary color and overrides the Dark/Light toggle (the theme's dark palette is used); chart colors follow each visual's axis order — most-used tool, alphabetical model tiers, the waterfall's category order — starting with the primary, the rest as complementary harmonies.</p>
+          ${prefsUI.themeStatus ? `<p class="mesh-msg ${prefsUI.themeStatus.type}">${esc(prefsUI.themeStatus.text)}</p>` : ""}
+        </div>
+        <div class="mesh-section">
+          <h2>Usage history retention</h2>
+          <p class="mesh-msg info">How many days of logged turns and tool calls to keep. Older records are purged automatically as new turns arrive. Leave empty (or 0) to keep everything.</p>
+          <div class="mesh-row">
+            <input class="mesh-input" id="pref-retention" type="number" min="0" step="1"
+              style="width:120px" value="${days === null || days === undefined || days === 0 ? "" : esc(days)}" placeholder="keep all" />
+            <span class="mesh-msg info">days</span>
+            <button class="mesh-btn" id="pref-save-btn">Save</button>
+          </div>
+          ${prefsUI.message ? `<p class="mesh-msg ${prefsUI.message.type}">${esc(prefsUI.message.text)}</p>` : ""}
+        </div>`;
+        syncThemeModeButtons();
+
+        document.querySelectorAll('#settings-body button[data-mode]').forEach((btn) => {
+          btn.addEventListener("click", () => {
+            const mode = btn.dataset.mode;
+            localStorage.setItem(THEME_MODE_KEY, mode);
+            setThemeMode(mode);
+            syncThemeModeButtons();
+            repaintAfterThemeChange();
+          });
+        });
+
+        document.getElementById("theme-apply-btn").addEventListener("click", async () => {
+          const input = document.getElementById("theme-url-input");
+          const raw = input.value.trim();
+          const applyBtn = document.getElementById("theme-apply-btn");
+          applyBtn.disabled = true;
+          prefsUI.themeStatus = { type: "info", text: "Loading theme…" };
+          renderPreferencesBody();
+          try {
+            const name = await loadTweakcnTheme(raw);
+            localStorage.setItem(THEME_URL_KEY, raw);
+            setThemeMode("dark");
+            prefsUI.themeStatus = { type: "info", text: `Applied theme: ${name}. The Dark/Light toggle is disabled while a theme is active.` };
+            repaintAfterThemeChange();
+          } catch (err) {
+            prefsUI.themeStatus = { type: "error", text: String(err.message || err) };
+          }
+          renderPreferencesBody();
+        });
+
+        const clearBtn = document.getElementById("theme-clear-btn");
+        if (clearBtn)
+          clearBtn.addEventListener("click", () => {
+            localStorage.removeItem(THEME_URL_KEY);
+            clearCustomTheme();
+            setThemeMode(localStorage.getItem(THEME_MODE_KEY) || "dark");
+            prefsUI.themeStatus = { type: "info", text: "Theme cleared — back to the Dark/Light toggle." };
+            renderPreferencesBody();
+            repaintAfterThemeChange();
+          });
+
+        document.getElementById("pref-save-btn").addEventListener("click", async () => {
+          const raw = document.getElementById("pref-retention").value.trim();
+          try {
+            const resp = await fetch("/api/preferences", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ token_usage_retention_days: raw === "" ? null : raw }),
+            });
+            const result = await resp.json();
+            if (result.ok === false) {
+              prefsUI.message = { type: "error", text: result.error || "Could not save." };
+            } else {
+              prefsUI.message = {
+                type: "info",
+                text: raw === "" ? "Retention cleared — everything is kept." : `Keeping ${raw} days of history.`,
+              };
+            }
+          } catch (err) {
+            prefsUI.message = { type: "error", text: String(err) };
+          }
+          prefsUI.prefs = await fetchPreferences();
+          renderPreferencesBody();
+        });
+      }
+
+      function syncThemeModeButtons() {
+        const mode = document.documentElement.dataset.theme === "light" ? "light" : "dark";
+        document
+          .querySelectorAll('#settings-body button[data-mode]')
+          .forEach((b) => {
+            b.classList.toggle("active", b.dataset.mode === mode && !customThemeActive);
+            b.disabled = customThemeActive;
+          });
+      }
+
+      // --- Mesh Network tab ---
+      async function fetchInterfaces() {
+        try {
+          const resp = await fetch("/mesh/api/interfaces", { cache: "no-store" });
+          if (!resp.ok) return null;
+          return await resp.json();
+        } catch {
+          return null;
+        }
+      }
 
       function renderMeshBody() {
         const s = meshUI.status;
         if (!s) {
-          meshBody.innerHTML =
+          settingsBody.innerHTML =
             '<p class="mesh-msg info">The mesh control API is unavailable. The dashboard must be served by the local Drachometer server (http://localhost:9873) to configure a mesh network.</p>';
           return;
         }
         if (s.available === false) {
-          meshBody.innerHTML =
+          settingsBody.innerHTML =
             '<p class="mesh-msg info">Mesh support is not available in this installation.</p>';
           return;
         }
@@ -2643,8 +3366,9 @@
           )}</p>`;
         }
 
-        // Current mesh panel
+        // Current mesh panel + one-click share string.
         if (s.enabled) {
+          const shareString = `${s.mesh_id || ""} ${s.advertise || ""}`.trim();
           const dotClass = s.connected ? "connected" : "";
           html += `<div class="mesh-section">
             <h2>Current mesh</h2>
@@ -2654,12 +3378,19 @@
             </div>
             <div class="mesh-row" style="margin-top:8px">
               <input class="mesh-input" value="${esc(s.mesh_id || "")}" readonly
-                title="Current mesh ID" onclick="this.select()" style="width:100%" />
-            </div>
-            <div class="mesh-stat-grid">
-              <div class="mesh-stat"><div class="label">Connection</div><div class="value">${
+                title="Current mesh ID" onclick="this.select()" style="flex:1;min-width:200px" />
+              <div class="mesh-stat" style="min-width:200px"><div class="label">Connection</div><div class="value" style="font-size:14px">${
                 s.connected ? "Connected" : "No active peers"
               }</div></div>
+            </div>
+            <div class="mesh-row">
+              <input class="mesh-input" id="mesh-share-string" readonly
+                title="Share string: mesh id + this machine's address"
+                onclick="this.select()" style="flex:1;min-width:260px" value="${esc(shareString)}" />
+              <button class="mesh-btn secondary" id="mesh-share-copy">Copy</button>
+            </div>
+            <p class="mesh-msg info">Send this to a peer — pasting it into their "Join by mesh id" box joins them to your mesh.</p>
+            <div class="mesh-stat-grid">
               <div class="mesh-stat"><div class="label">Peers connected</div><div class="value">${
                 s.peer_count || 0
               }</div></div>
@@ -2669,6 +3400,9 @@
               <div class="mesh-stat"><div class="label">Mean propagation</div><div class="value">${meshFmtProp(
                 s.mean_propagation_seconds,
               )}</div></div>
+              <div class="mesh-stat"><div class="label">Listening on</div><div class="value" style="font-size:14px">${esc(
+                s.listen_host || "0.0.0.0",
+              )}:${s.listen_port || ""}</div></div>
             </div>`;
 
           const peers = s.active_peers || [];
@@ -2686,27 +3420,6 @@
             html += `<p class="mesh-msg info">No other active nodes on this mesh yet.</p>`;
           }
 
-          const adjacent = s.adjacent_meshes || [];
-          html += `<h3>Adjacent mesh networks</h3>`;
-          if (adjacent.length) {
-            html += `<ul class="mesh-list">${adjacent
-              .map(
-                (m) =>
-                  `<li><span>${esc(m.name)}-${"\u2022".repeat(
-                    (m.suffix || "").length || 8,
-                  )}</span><span class="muted">${
-                    m.node_count
-                  } node(s)</span></li>`,
-              )
-              .join("")}</ul>`;
-          } else {
-            html += `<p class="mesh-msg info">${
-              meshUI.scanning
-                ? "Scanning local subnets\u2026"
-                : "No adjacent mesh networks with active nodes were found."
-            }</p>`;
-          }
-
           html += `<div class="mesh-row">
             <button class="mesh-btn danger" id="mesh-leave-btn">Leave this mesh</button>
             <button class="mesh-btn secondary" id="mesh-rescan-btn">${
@@ -2715,47 +3428,57 @@
           </div></div>`;
         }
 
-        // Discovered meshes (join). Only one mesh at a time, so joining leaves the current one.
-        html += `<div class="mesh-section"><h2>${
-          s.enabled ? "Switch to a discovered mesh" : "Discovered mesh networks"
-        }</h2>`;
-        const discovered = (meshUI.scan && meshUI.scan.meshes
-          ? meshUI.scan.meshes
-          : []
-        ).filter((m) => !m.is_current);
+        // Listen interface selector.
+        html += `<div class="mesh-section"><h2>Listen interface</h2>
+          <p class="mesh-msg info">Which network interface accepts mesh connections. "All interfaces" (the default) accepts on every NIC; a specific address restricts the listener to that subnet. Changing this restarts the mesh listener.</p>`;
+        const ifs = meshUI.interfaces;
+        if (ifs && ifs.available !== false) {
+          const current = ifs.listen_host || "0.0.0.0";
+          const options = [
+            `<option value="0.0.0.0"${current === "0.0.0.0" ? " selected" : ""}>All interfaces (0.0.0.0)</option>`,
+            `<option value="127.0.0.1"${current === "127.0.0.1" ? " selected" : ""}>Loopback only (127.0.0.1)</option>`,
+            ...(ifs.interfaces || []).map(
+              (i) =>
+                `<option value="${esc(i.ip)}"${current === i.ip ? " selected" : ""}>${esc(i.ip)} — ${esc(i.subnet)}</option>`,
+            ),
+          ];
+          html += `<div class="mesh-row">
+            <select class="mesh-select" id="mesh-listen-select" style="flex:1;min-width:260px">${options.join("")}</select>
+            <button class="mesh-btn secondary" id="mesh-listen-apply">Apply</button>
+          </div>`;
+        } else {
+          html += `<p class="mesh-msg info">${
+            meshUI.interfaces === null ? "Detecting network interfaces…" : "Could not detect network interfaces."
+          }</p>`;
+        }
+        html += `</div>`;
+
+        // Nearby nodes (privacy: a scan never reveals other meshes' ids).
+        html += `<div class="mesh-section"><h2>Nearby Drachometer nodes</h2>`;
+        const nearby = (meshUI.scan && meshUI.scan.unmatched_nodes) || [];
+        const ownMeshNodes = meshUI.scan
+          ? (meshUI.scan.meshes || []).reduce((sum, m) => sum + (m.node_count || 0), 0)
+          : 0;
         html += `<p class="mesh-msg info">Scanned ${
           meshUI.scan ? meshUI.scan.scanned_hosts : 0
         } host(s) across ${
           meshUI.scan && meshUI.scan.subnets ? meshUI.scan.subnets.length : 0
-        } subnet(s). To join, enter the segment of the mesh name after the final dash.</p>`;
+        } subnet(s). ${
+          s.enabled && ownMeshNodes
+            ? `${ownMeshNodes} node(s) of your mesh were found on the local subnets. `
+            : ""
+        }Mesh ids are never broadcast — ask a node's owner for their share string to join.</p>`;
         if (meshUI.scanning) {
           html += `<p class="mesh-msg info">Scanning local subnets\u2026</p>`;
-        } else if (discovered.length) {
-          html += `<ul class="mesh-list">${discovered
-            .map((m, i) => {
-              const peers = (m.nodes || [])
-                .map((n) => n.advertise)
-                .filter(Boolean)
-                .join(",");
-              return `<li>
-                <div>
-                  <div><strong>${esc(m.name)}</strong>-${"\u2022".repeat(
-                    (m.suffix || "").length || 8,
-                  )}</div>
-                  <div class="muted">${m.node_count} active node(s)</div>
-                </div>
-                <div class="mesh-row" style="margin-top:0">
-                  <input class="mesh-input mesh-join-suffix" data-idx="${i}" style="width:120px"
-                    placeholder="suffix" />
-                  <button class="mesh-btn mesh-join-btn" data-idx="${i}"
-                    data-name="${esc(m.name)}" data-suffix="${esc(m.suffix)}"
-                    data-peers="${esc(peers)}">Join</button>
-                </div>
-              </li>`;
-            })
+        } else if (nearby.length) {
+          html += `<ul class="mesh-list">${nearby
+            .map(
+              (n) =>
+                `<li><span>${esc(n.advertise || "")}</span><span class="muted">mesh id not disclosed</span></li>`,
+            )
             .join("")}</ul>`;
         } else {
-          html += `<p class="mesh-msg info">No other mesh networks found on your local subnets.</p>`;
+          html += `<p class="mesh-msg info">No other Drachometer nodes found on your local subnets.</p>`;
         }
         if (!s.enabled) {
           html += `<div class="mesh-row">
@@ -2766,12 +3489,12 @@
         }
         html += `</div>`;
 
-        // Manual join (for meshes on other subnets)
+        // Manual join: one paste box accepting the mesh id, a peer address, or both.
         html += `<div class="mesh-section"><h2>Join by mesh id</h2>
-          <p class="mesh-msg info">Know the full mesh id and a peer address? Join directly.</p>
+          <p class="mesh-msg info">Paste the mesh id, a peer address (host:port), or both — separated by a space. Example: <span class="mono">home-abcd1234 192.168.1.10:9874</span></p>
           <div class="mesh-row">
-            <input class="mesh-input" id="mesh-manual-id" placeholder="name-abcd1234" style="width:180px" />
-            <input class="mesh-input" id="mesh-manual-peer" placeholder="192.168.1.10:9874" style="width:180px" />
+            <input class="mesh-input" id="mesh-join-input" placeholder="home-abcd1234 192.168.1.10:9874"
+              style="flex:1;min-width:260px" />
             <button class="mesh-btn" id="mesh-manual-join">Join</button>
           </div></div>`;
 
@@ -2783,13 +3506,31 @@
             <button class="mesh-btn" id="mesh-create-btn">Create</button>
           </div></div>`;
 
-        meshBody.innerHTML = html;
+        settingsBody.innerHTML = html;
         wireMeshButtons();
       }
 
+      function parseJoinInput(text) {
+        const tokens = (text || "").trim().split(/[\s,]+/).filter(Boolean);
+        let meshId = null;
+        let peer = null;
+        tokens.forEach((t) => {
+          if (t.includes(":")) {
+            if (!peer) peer = t; // host:port
+            return;
+          }
+          // Mesh ids are <name>-<8 hex>; anything else isn't one.
+          if (!meshId && /^[A-Za-z0-9][A-Za-z0-9_-]*-[0-9a-fA-F]{8}$/.test(t)) {
+            meshId = t;
+          }
+        });
+        return { meshId, peer };
+      }
+
+
       function meshSetBusy(busy) {
         meshUI.busy = busy;
-        meshBody
+        settingsBody
           .querySelectorAll("button.mesh-btn")
           .forEach((b) => (b.disabled = busy));
       }
@@ -2844,59 +3585,50 @@
             meshDoAction(() => meshPost("/mesh/api/leave", {}));
           });
 
-        meshBody.querySelectorAll(".mesh-join-btn").forEach((btn) => {
-          btn.addEventListener("click", () => {
-            const name = btn.dataset.name;
-            const suffix = btn.dataset.suffix;
-            const peers = (btn.dataset.peers || "")
-              .split(",")
-              .filter(Boolean);
-            const input = meshBody.querySelector(
-              `.mesh-join-suffix[data-idx="${btn.dataset.idx}"]`,
-            );
-            const entered = (input.value || "").trim();
-            if (!entered) {
-              meshUI.message = {
-                type: "error",
-                text: "Enter the mesh name segment after the final dash to join.",
-              };
-              renderMeshBody();
-              return;
+        const shareCopy = document.getElementById("mesh-share-copy");
+        if (shareCopy)
+          shareCopy.addEventListener("click", async () => {
+            const input = document.getElementById("mesh-share-string");
+            try {
+              await navigator.clipboard.writeText(input.value);
+              shareCopy.textContent = "Copied!";
+              setTimeout(() => (shareCopy.textContent = "Copy"), 1500);
+            } catch {
+              input.select(); // clipboard denied: selection is the fallback
             }
-            if (entered !== suffix) {
-              meshUI.message = {
-                type: "error",
-                text: "That segment does not match this mesh network.",
-              };
-              renderMeshBody();
-              return;
-            }
-            meshDoAction(() =>
-              meshPost("/mesh/api/join", {
-                mesh_id: `${name}-${entered}`,
-                peers,
-              }),
-            );
           });
-        });
+
+        const listenApply = document.getElementById("mesh-listen-apply");
+        if (listenApply)
+          listenApply.addEventListener("click", () => {
+            const host = document.getElementById("mesh-listen-select").value;
+            meshDoAction(() => meshPost("/mesh/api/listen", { listen_host: host }));
+          });
 
         const manualJoin = document.getElementById("mesh-manual-join");
         if (manualJoin)
           manualJoin.addEventListener("click", () => {
-            const id = document
-              .getElementById("mesh-manual-id")
-              .value.trim();
-            const peer = document
-              .getElementById("mesh-manual-peer")
-              .value.trim();
-            if (!id) {
-              meshUI.message = { type: "error", text: "Enter a mesh id to join." };
+            const raw = document.getElementById("mesh-join-input").value;
+            const { meshId, peer } = parseJoinInput(raw);
+            if (!meshId && !peer) {
+              meshUI.message = {
+                type: "error",
+                text: "Paste a mesh id (name-abcd1234) and optionally a peer address (host:port).",
+              };
+              renderMeshBody();
+              return;
+            }
+            if (!meshId) {
+              meshUI.message = {
+                type: "error",
+                text: "A mesh id is required to join. Ask that node's owner for their share string (mesh id + address).",
+              };
               renderMeshBody();
               return;
             }
             meshDoAction(() =>
               meshPost("/mesh/api/join", {
-                mesh_id: id,
+                mesh_id: meshId,
                 peers: peer ? [peer] : [],
               }),
             );
@@ -2936,7 +3668,8 @@
               `https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.12.0/${f}`,
           });
           DB = new sqlJs.Database(new Uint8Array(await resp.arrayBuffer()));
-          await loadPricing();
+          await Promise.all([loadPricing(), applyTheme()]);
+          lastRenderAt = Date.now(); // first paint counts as a render
           document.getElementById("drop-zone").style.display = "none";
           document.getElementById("dashboard").style.display = "block";
           render();

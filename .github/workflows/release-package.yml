@@ -39,6 +39,7 @@ jobs:
             drachometer-dashboard.html \
             drachometer-serve-dashboard.py \
             drachometer_mesh.py \
+            drachometer_common.py \
             drachometer-version.json
 
       - name: Upload release zip

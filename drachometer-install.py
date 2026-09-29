@@ -24,6 +24,11 @@ import time
 import urllib.request
 from pathlib import Path
 
+# Shared pricing/model-inference/schema helpers (next to this script in the
+# repo and in every installed layout).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import drachometer_common as common  # noqa: E402
+
 CLAUDE_DIR = Path.home() / ".claude"
 HOOKS_ROOT_DIR = CLAUDE_DIR / "hooks"
 APP_HOOKS_SUBDIR = "drachometer"
@@ -39,6 +44,7 @@ REPO_HOOKS = Path(__file__).resolve().parent / "hooks"
 REPO_DASHBOARD = Path(__file__).resolve().parent / "drachometer-dashboard.html"
 REPO_SERVER = Path(__file__).resolve().parent / "drachometer-serve-dashboard.py"
 REPO_MESH = Path(__file__).resolve().parent / "drachometer_mesh.py"
+REPO_COMMON = Path(__file__).resolve().parent / "drachometer_common.py"
 
 REPO_README = Path(__file__).resolve().parent / "README.md"
 REPO_LOGO = Path(__file__).resolve().parent / "drachometer-logo.svg"
@@ -52,40 +58,13 @@ HOOK_FILES = {
     "drachometer-log-usage.py": REPO_HOOKS / "drachometer-log-usage.py",
     "drachometer-serve-dashboard.py": REPO_SERVER,
     "drachometer_mesh.py": REPO_MESH,
+    "drachometer_common.py": REPO_COMMON,
     "drachometer-dashboard.html": REPO_DASHBOARD,
     "README.md": REPO_README,
     "drachometer-logo.svg": REPO_LOGO,
     "drachometer-version.json": REPO_VERSION,
     "drachometer-pricing.json": REPO_PRICING,
 }
-
-# Offline fallback pricing (USD per 1M tokens). Overlaid below from drachometer-pricing.json
-# so model rows the installer creates/backfills use the latest published rates.
-MODEL_TIER_PRICING = {
-    "opus":   {"input": 5.0, "output": 25.0, "cache_read": 0.50, "cache_create": 6.25},
-    "sonnet": {"input": 3.0, "output": 15.0, "cache_read": 0.30, "cache_create": 3.75},
-    "haiku":  {"input": 1.0, "output": 5.0,  "cache_read": 0.10, "cache_create": 1.25},
-}
-
-
-def _load_pricing_overrides() -> None:
-    try:
-        data = json.loads(REPO_PRICING.read_text(encoding="utf-8"))
-        tiers = data.get("tiers", data)
-        if isinstance(tiers, dict):
-            for tier, p in tiers.items():
-                if isinstance(p, dict) and isinstance(p.get("input"), (int, float)):
-                    MODEL_TIER_PRICING[tier] = {
-                        "input": p.get("input"),
-                        "output": p.get("output"),
-                        "cache_read": p.get("cache_read"),
-                        "cache_create": p.get("cache_create"),
-                    }
-    except (OSError, json.JSONDecodeError, ValueError):
-        pass
-
-
-_load_pricing_overrides()
 
 
 def semver_key(version: str | None) -> tuple[int, int, int]:
@@ -361,39 +340,6 @@ def run_install_migrations(installed_version: str) -> None:
     migrate_settings_for_server_changes()
 
 
-def infer_model_attributes(model_key: str | None) -> dict:
-    key = (model_key or "").strip()
-    lower = key.lower()
-
-    if "fable" in lower:
-        tier = "fable"
-    elif "opus" in lower:
-        tier = "opus"
-    elif "sonnet" in lower:
-        tier = "sonnet"
-    elif "haiku" in lower:
-        tier = "haiku"
-    else:
-        tier = None
-
-    parts = [p for p in key.split("-") if p]
-    model_name = " ".join(parts[:2]).title() if len(parts) >= 2 and parts[0].lower() == "claude" else (parts[0].title() if parts else None)
-    version_match = re.search(r"(\d+(?:[-.]\d+)*(?:-\d{8})?)", key)
-    model_version = version_match.group(1) if version_match else None
-    provider = "Anthropic" if lower.startswith("claude-") or lower.startswith("claude") else None
-
-    pricing = MODEL_TIER_PRICING.get(tier, {})
-    return {
-        "model_name": model_name,
-        "model_version": model_version,
-        "model_provider": provider,
-        "input_price_per_mtok": pricing.get("input"),
-        "output_price_per_mtok": pricing.get("output"),
-        "cache_read_price_per_mtok": pricing.get("cache_read"),
-        "cache_creation_price_per_mtok": pricing.get("cache_create"),
-    }
-
-
 def prompt_missing_model_attributes(model_key: str, attrs: dict) -> dict:
     if not sys.stdin.isatty():
         return attrs
@@ -431,29 +377,18 @@ def prompt_missing_model_attributes(model_key: str, attrs: dict) -> dict:
 
 
 def ensure_model_row(conn: sqlite3.Connection, model_key: str, prompt_if_missing: bool) -> int:
-    row = conn.execute("SELECT id FROM models WHERE model_key = ?", (model_key,)).fetchone()
+    key = (model_key or "").strip()
+    if not key:
+        return None
+    row = conn.execute("SELECT id FROM models WHERE model_key = ?", (key,)).fetchone()
     if row:
         return row[0]
 
-    attrs = infer_model_attributes(model_key)
+    attrs = common.infer_model_attributes(key)
     if prompt_if_missing:
-        attrs = prompt_missing_model_attributes(model_key, attrs)
+        attrs = prompt_missing_model_attributes(key, attrs)
 
-    cur = conn.execute(
-        """
-        INSERT INTO models (
-            model_key, model_name, model_version, model_provider,
-            input_price_per_mtok, output_price_per_mtok,
-            cache_read_price_per_mtok, cache_creation_price_per_mtok
-        ) VALUES (
-            :model_key, :model_name, :model_version, :model_provider,
-            :input_price_per_mtok, :output_price_per_mtok,
-            :cache_read_price_per_mtok, :cache_creation_price_per_mtok
-        )
-        """,
-        {"model_key": model_key, **attrs},
-    )
-    return cur.lastrowid
+    return common.insert_model_row(conn, key, attrs)
 
 
 def backfill_model_dimension(conn: sqlite3.Connection, prompt_if_missing: bool) -> None:
@@ -566,73 +501,11 @@ def merge_settings(python_exe: str) -> None:
 
 def init_database() -> None:
     with sqlite3.connect(DB_PATH) as conn:
-        conn.executescript("""
-            CREATE TABLE IF NOT EXISTS models (
-                id                           INTEGER PRIMARY KEY AUTOINCREMENT,
-                model_key                    TEXT    NOT NULL UNIQUE,
-                model_name                   TEXT,
-                model_version                TEXT,
-                model_provider               TEXT,
-                input_price_per_mtok         REAL,
-                output_price_per_mtok        REAL,
-                cache_read_price_per_mtok    REAL,
-                cache_creation_price_per_mtok REAL
-            );
-
-            CREATE TABLE IF NOT EXISTS turns (
-                id                    INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id            TEXT    NOT NULL,
-                turn_id               TEXT    NOT NULL,
-                recorded_at           TEXT    NOT NULL,
-                stop_reason           TEXT,
-                input_tokens          INTEGER NOT NULL DEFAULT 0,
-                output_tokens         INTEGER NOT NULL DEFAULT 0,
-                cache_read_tokens     INTEGER NOT NULL DEFAULT 0,
-                cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
-                model_id              INTEGER REFERENCES models(id),
-                UNIQUE(session_id, turn_id)
-            );
-
-            CREATE TABLE IF NOT EXISTS tool_calls (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                turn_pk     INTEGER REFERENCES turns(id) ON DELETE CASCADE,
-                session_id  TEXT    NOT NULL,
-                turn_id     TEXT    NOT NULL,
-                recorded_at TEXT    NOT NULL,
-                tool_name   TEXT,
-                tool_input  TEXT,
-                exit_code   INTEGER,
-                error       TEXT
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_turns_session ON turns(session_id, turn_id);
-            CREATE INDEX IF NOT EXISTS idx_calls_turn_pk ON tool_calls(turn_pk);
-            CREATE INDEX IF NOT EXISTS idx_calls_session ON tool_calls(session_id, turn_id);
-
-            -- Mesh replication oplog (empty and harmless when mesh is disabled).
-            CREATE TABLE IF NOT EXISTS oplog (
-                event_id    TEXT    PRIMARY KEY,
-                origin_node TEXT    NOT NULL,
-                lamport     INTEGER NOT NULL,
-                created_at  TEXT    NOT NULL,
-                entity      TEXT    NOT NULL,
-                op          TEXT    NOT NULL DEFAULT 'upsert',
-                payload     TEXT    NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_oplog_origin_lamport ON oplog(origin_node, lamport);
-            CREATE INDEX IF NOT EXISTS idx_oplog_lamport        ON oplog(lamport);
-        """)
-        for col, typedef in [("cwd", "TEXT"), ("git_branch", "TEXT"), ("model", "TEXT"), ("model_id", "INTEGER REFERENCES models(id)")]:
-            try:
-                conn.execute(f"ALTER TABLE turns ADD COLUMN {col} {typedef}")
-            except sqlite3.OperationalError:
-                pass
-        try:
-            conn.execute("ALTER TABLE tool_calls ADD COLUMN uid TEXT")
-        except sqlite3.OperationalError:
-            pass
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_turns_model_id ON turns(model_id)")
-        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_tool_calls_uid ON tool_calls(uid)")
+        # Full schema (usage tables + mesh oplog + legacy column backfills)
+        # lives in drachometer_common so the hook's lazy init and this
+        # installer path can never diverge. Model backfilling happens below so
+        # unknown models can be prompted for interactively.
+        common.ensure_base_schema(conn, backfill_model_ids=False)
         backfill_model_dimension(conn, prompt_if_missing=True)
 
         conn.execute("CREATE TABLE IF NOT EXISTS schema_migrations (version TEXT PRIMARY KEY)")
@@ -653,7 +526,7 @@ def smoke_test(python_exe: str) -> bool:
         "usage": {"input_tokens": 1, "output_tokens": 1},
     })
     try:
-        result = subprocess.run(
+        subprocess.run(
             [python_exe, hook_script, "stop"],
             input=payload, capture_output=True, text=True, timeout=10,
         )

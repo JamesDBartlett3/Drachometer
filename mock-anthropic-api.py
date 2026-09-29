@@ -42,11 +42,7 @@ import os
 import random
 import json
 import logging
-import asyncio
-import json
-import logging
 import sys
-from typing import Dict, Any, Tuple
 from contextlib import asynccontextmanager
 
 try:
@@ -104,7 +100,8 @@ async def messages_proxy(request: Request):
             cache_read_input_tokens = int(base_scale * random.uniform(0.85, 0.98))
             cache_creation_input_tokens = int(base_scale * random.uniform(0.0, 0.05))
             input_tokens = base_scale - cache_read_input_tokens - cache_creation_input_tokens
-            if input_tokens < 0: input_tokens = 0
+            if input_tokens < 0:
+                input_tokens = 0
             
             tool_name = random.choice([None, "read_file", "run_in_terminal", "grep_search"])
             
@@ -112,10 +109,7 @@ async def messages_proxy(request: Request):
             stop_reason = "tool_use" if tool_name else "end_turn"
             
             if tool_name:
-                import subprocess
-                import datetime
-                import sys
-                import uuid
+                pass
                 # We do not mock log-usage directly anymore to avoid fake session generation. 
                 # This ensures the DB reflects genuine stateless multi-subprocess invocations.
 
@@ -159,14 +153,14 @@ async def messages_proxy(request: Request):
     cache_read_input_tokens = int(base_scale * random.uniform(0.85, 0.98))
     cache_creation_input_tokens = int(base_scale * random.uniform(0.0, 0.05))
     input_tokens = base_scale - cache_read_input_tokens - cache_creation_input_tokens
-    if input_tokens < 0: input_tokens = 0
+    if input_tokens < 0:
+        input_tokens = 0
     
     tool_name = random.choice([None, "read_file", "run_in_terminal", "grep_search"])
     stop_reason = "tool_use" if tool_name else "end_turn"
     
     if tool_name:
-        import subprocess
-        import sys
+        pass
         # We do not mock log-usage directly anymore to avoid fake session generation. 
         # This ensures the DB reflects genuine stateless multi-subprocess invocations.
 

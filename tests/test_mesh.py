@@ -263,10 +263,12 @@ class TestEventIdentity(MeshTestBase):
                  "cache_creation_tokens": 0, "cwd": None, "git_branch": None,
                  "model_key": "claude-opus-4-8"}
         older = dict(newer, recorded_at="2026-06-26T08:00:00+00:00", input_tokens=1)
-        mesh.apply_event(conn, {"event_id": "e-new", "origin_node": "n", "lamport": 2,
+        mesh.apply_event(conn, {"event_id": mesh.event_id_for("turn", mesh._canonical(newer)),
+                                "origin_node": "n", "lamport": 2,
                                 "created_at": newer["recorded_at"], "entity": "turn",
                                 "op": "upsert", "payload": newer})
-        mesh.apply_event(conn, {"event_id": "e-old", "origin_node": "n", "lamport": 1,
+        mesh.apply_event(conn, {"event_id": mesh.event_id_for("turn", mesh._canonical(older)),
+                                "origin_node": "n", "lamport": 1,
                                 "created_at": older["recorded_at"], "entity": "turn",
                                 "op": "upsert", "payload": older})
         conn.commit()
@@ -274,6 +276,57 @@ class TestEventIdentity(MeshTestBase):
             "SELECT input_tokens FROM turns WHERE session_id='s1'").fetchone()[0]
         conn.close()
         self.assertEqual(tokens, 999)  # newer record wins regardless of apply order
+
+    def test_forged_event_id_is_rejected(self):
+        # event_id must equal the content hash of the payload; a peer that
+        # cannot prove an event's identity must not get it into the oplog.
+        dst = self.tmp / "dst.db"
+        conn = sqlite3.connect(dst)
+        conn.executescript(BASE_SCHEMA)
+        mesh.ensure_schema(conn)
+        payload = {"session_id": "s1", "turn_id": "turn-1",
+                   "recorded_at": "2026-06-26T12:00:00+00:00", "stop_reason": "end_turn",
+                   "input_tokens": 1, "output_tokens": 1, "cache_read_tokens": 0,
+                   "cache_creation_tokens": 0, "cwd": None, "git_branch": None,
+                   "model_key": "claude-opus-4-8"}
+        rejected = mesh.apply_event(conn, {"event_id": "0" * 40, "origin_node": "n",
+                                           "lamport": 1, "created_at": payload["recorded_at"],
+                                           "entity": "turn", "op": "upsert", "payload": payload})
+        conn.commit()
+        self.assertFalse(rejected)
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM oplog").fetchone()[0], 0)
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM turns").fetchone()[0], 0)
+        conn.close()
+
+    def test_malformed_events_are_rejected_not_fatal(self):
+        dst = self.tmp / "dst.db"
+        conn = sqlite3.connect(dst)
+        conn.executescript(BASE_SCHEMA)
+        mesh.ensure_schema(conn)
+        bad_events = [
+            {"origin_node": "n", "lamport": 1, "created_at": "2026-06-26T00:00:00+00:00",
+             "entity": "turn", "payload": "{}"},                                # no event_id
+            {"event_id": "x", "origin_node": "n", "lamport": "not-a-number",
+             "created_at": "2026-06-26T00:00:00+00:00", "entity": "turn", "payload": "{}"},
+            {"event_id": "x", "origin_node": "", "lamport": 1,
+             "created_at": "2026-06-26T00:00:00+00:00", "entity": "turn", "payload": "{}"},
+            {"event_id": "x", "origin_node": "n", "lamport": 1,
+             "created_at": "2026-06-26T00:00:00+00:00", "entity": "turn", "payload": "not-json"},
+            "not-even-a-dict",
+        ]
+        for ev in bad_events:
+            self.assertFalse(mesh.apply_event(conn, ev))
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM oplog").fetchone()[0], 0)
+        conn.close()
+
+    def test_peer_registry_rejects_invalid_advertise_addresses(self):
+        registry = mesh._PeerRegistry({"peers": []})
+        for bad in ("no-port", ":9874", "host:", "host:99999", "bad host:9874", 12345, ""):
+            registry.add(bad)
+        self.assertEqual(registry.all(), [])
+        registry.add("192.168.1.10:9874")
+        registry.add("mynode.home.arpa:9874")
+        self.assertEqual(registry.all(), ["192.168.1.10:9874", "mynode.home.arpa:9874"])
 
 
 class TestImportMerge(MeshTestBase):
@@ -427,7 +480,7 @@ class TestTwoNodeConvergence(MeshTestBase):
                             input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
                             cwd, git_branch, model, model_id)
                         VALUES (?, ?, ?, 'end_turn', 200, 100, 10, 5, '/tmp', 'main', ?, ?)""",
-                    (session_id, turn_id, f"2026-06-26T10:30:00+00:00", "claude-opus-4-8", model_id),
+                    (session_id, turn_id, "2026-06-26T10:30:00+00:00", "claude-opus-4-8", model_id),
                 )
                 turn_pk = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
                 tool_call_id = conn.execute(
@@ -436,7 +489,7 @@ class TestTwoNodeConvergence(MeshTestBase):
                             tool_name, tool_input, exit_code, error)
                         VALUES (?, ?, ?, ?, ?, 'Bash', '{}', 0, NULL)""",
                     (f"{node_id}-tc-{session_id}", turn_pk, session_id, turn_id,
-                     f"2026-06-26T10:30:00+00:00"),
+                     "2026-06-26T10:30:00+00:00"),
                 ).lastrowid
                 conn.commit()
                 turn_row = conn.execute(
@@ -743,10 +796,29 @@ class TestSubnetDiscovery(MeshTestBase):
         self.assertFalse(anonymous["mesh_id_match"])
         self.assertNotIn("mesh_id", anonymous)
 
+        # Anonymous discovery proves "a drachometer node lives here" but must
+        # never disclose which mesh it belongs to.
         with urllib.request.urlopen(f"http://127.0.0.1:{port}/mesh/discover", timeout=0.5) as resp:
             discovered = json.loads(resp.read().decode("utf-8"))
         self.assertTrue(discovered["ok"])
-        self.assertEqual(discovered["mesh_id"], "home-cccc3333")
+        self.assertFalse(discovered["mesh_id_match"])
+        self.assertNotIn("mesh_id", discovered)
+        self.assertNotIn("node_id", discovered)
+
+        # A caller who already knows the mesh id gets a yes/no match answer.
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{port}{mesh._mesh_path('/mesh/discover', 'home-cccc3333')}",
+            timeout=0.5,
+        ) as resp:
+            matched = json.loads(resp.read().decode("utf-8"))
+        self.assertTrue(matched["mesh_id_match"])
+        self.assertNotIn("mesh_id", matched)
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{port}{mesh._mesh_path('/mesh/discover', 'wrong-ffffffff')}",
+            timeout=0.5,
+        ) as resp:
+            mismatched = json.loads(resp.read().decode("utf-8"))
+        self.assertFalse(mismatched["mesh_id_match"])
 
         hello = mesh.probe_node("127.0.0.1", port, mesh_id="home-cccc3333")
         self.assertIsNotNone(hello)
@@ -763,8 +835,11 @@ class TestSubnetDiscovery(MeshTestBase):
         result = mesh.discover_meshes(port=port, subnets=["127.0.0.0/30"])
         ids = {m["mesh_id"] for m in result["meshes"]}
         self.assertIn("home-cccc3333", ids)
+        self.assertEqual(result["unmatched_nodes"], [])
 
-    def test_discover_meshes_finds_other_mesh_than_current(self):
+    def test_discover_scans_report_other_nodes_without_mesh_ids(self):
+        # Nodes from a different mesh show up as reachable drachometer nodes
+        # but their mesh identity is never disclosed to a scanning stranger.
         db_a = self.tmp / "a.db"
         seed_db(db_a, "nodeA", ["a1"])
         port, listen_socket = self._reserve_port()
@@ -778,10 +853,31 @@ class TestSubnetDiscovery(MeshTestBase):
         }))
 
         result = mesh.discover_meshes(port=port, subnets=["127.0.0.0/30"])
-        by_id = {m["mesh_id"]: m for m in result["meshes"]}
         self.assertEqual(result["current_mesh_id"], "home-cccc3333")
+        self.assertEqual(result["meshes"], [])  # no node answered for OUR mesh
+        self.assertEqual(len(result["unmatched_nodes"]), 1)
+        self.assertEqual(result["unmatched_nodes"][0]["advertise"], f"127.0.0.1:{port}")
+        self.assertNotIn("mesh_id", result["unmatched_nodes"][0])
+
+    def test_discover_matches_same_mesh_nodes_when_enabled(self):
+        db_a = self.tmp / "a.db"
+        seed_db(db_a, "nodeA", ["a1"])
+        port, listen_socket = self._reserve_port()
+        self._spawn_mesh_node(db_a, "nodeA", "lab-dddd4444", port, listen_socket=listen_socket)
+
+        mesh.CONFIG_PATH = self.tmp / "mesh.json"
+        mesh.save_config(mesh.normalize_config({
+            "enabled": True,
+            "mesh_id": "lab-dddd4444",
+            "node_id": "local-node",
+        }))
+
+        result = mesh.discover_meshes(port=port, subnets=["127.0.0.0/30"])
+        by_id = {m["mesh_id"]: m for m in result["meshes"]}
         self.assertIn("lab-dddd4444", by_id)
-        self.assertFalse(by_id["lab-dddd4444"]["is_current"])
+        self.assertTrue(by_id["lab-dddd4444"]["is_current"])
+        self.assertEqual(by_id["lab-dddd4444"]["node_count"], 1)
+        self.assertEqual(result["unmatched_nodes"], [])
 
     def test_discover_meshes_works_without_current_mesh(self):
         db_a = self.tmp / "a.db"
@@ -794,7 +890,10 @@ class TestSubnetDiscovery(MeshTestBase):
             mesh.CONFIG_PATH.unlink()
         result = mesh.discover_meshes(port=port, subnets=["127.0.0.0/30"])
         self.assertIsNone(result["current_mesh_id"])
-        self.assertEqual({m["mesh_id"] for m in result["meshes"]}, {"lab-dddd4444"})
+        self.assertEqual(result["meshes"], [])
+        self.assertEqual(
+            [n["advertise"] for n in result["unmatched_nodes"]], [f"127.0.0.1:{port}"]
+        )
 
     def test_probe_node_rejects_non_mesh_port(self):
         port, _ = self._reserve_port()  # bound but not a mesh server
@@ -984,6 +1083,29 @@ class TestRuntimeControl(MeshTestBase):
         self.assertTrue(mesh.runtime_status()["running"])
         self.assertTrue(mesh.stop_mesh())
         self.assertIsNone(mesh.mesh_uptime_seconds())
+
+
+class TestSelfTest(MeshTestBase):
+    """The mesh self-test simulation must pass inside the test suite too."""
+
+    def test_two_node_simulation_passes(self):
+        report = mesh.run_self_test()
+        failures = [c for c in report["checks"] if not c["ok"]]
+        self.assertTrue(report["checks"], "self-test produced no checks")
+        self.assertEqual(
+            failures, [],
+            "self-test check(s) failed: "
+            + "; ".join(f"{c['name']}: {c['detail']}" for c in failures),
+        )
+        self.assertTrue(report["ok"])
+        self.assertEqual(report["passed"], report["total"])
+
+    def test_self_test_restores_module_globals(self):
+        before = (mesh.DB_PATH, mesh.LOG_PATH)
+        mesh.run_self_test()
+        self.assertEqual((mesh.DB_PATH, mesh.LOG_PATH), before)
+        # And it must not have created anything in the real ~/.claude dir.
+        self.assertFalse(mesh.DB_PATH.exists())
 
 
 if __name__ == "__main__":

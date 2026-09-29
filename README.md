@@ -79,6 +79,10 @@ That's it. Usage is logged automatically from that point on.
 
 ### Tables
 
+Displayed in a tabbed interface (Repositories / Folders / Sessions / Recent Turns); the active tab persists across reloads.
+
+- **Repositories** — token usage and cost rolled up to the repository level; expand a repo to see the same stats per git branch
+- **Folders** — the directory hierarchy as an expandable tree with usage rolled up at every level; root-level folders start expanded one level
 - **Sessions** — cost, tokens, model, directory, and branch per session
 - **Recent Turns** — last 50 turns with full token breakdown
 
@@ -88,7 +92,11 @@ That's it. Usage is logged automatically from that point on.
 - **Hourly drill-down** — when a single date is selected, time-based charts automatically switch from daily to hourly granularity
 - **Multi-sort tables** — click any column header to sort; Ctrl+click to add secondary/tertiary sort columns (▲/▼ indicators with subscript priority)
 - **Rich chart tooltips** — hover over any chart element to see cost and full token breakdown (uncached input, output, cache read, cache create)
-- **Live refresh** — the dashboard auto-updates via SSE when the database changes (no manual reload needed)
+- **Live refresh** — the dashboard auto-updates via SSE when the database changes (no manual reload needed); re-renders are debounced to at most one per 5-second window so active sessions don't make the visuals twitch
+- **Settings modal** — the hamburger menu opens a two-tab settings modal (Preferences with theme + usage-history retention; Mesh Network for all mesh configuration); the "peers connected" pill opens the same modal on the Mesh tab
+- **Theme** — dark/light mode toggle in Preferences, plus a field to paste a [tweakcn](https://tweakcn.com/themes/community) theme link (or slug) for any community theme. A theme recolors the app around its primary color and overrides the Dark/Light toggle; chart colors are assigned in each visual's axis order (most-used tool, alphabetical model tiers, the waterfall's category order) starting with the primary, with the remaining datapoints colored by color-theory harmonies of it
+- **Mesh share string** — one-click copy of `<mesh-id> <lan-ip>:<port>`, which a peer can paste into their single "Join by mesh id" box (accepting the id, the address, or both)
+- **Listen interface selector** — choose which network interface/subnet the mesh listener binds to (all interfaces, loopback, or a detected NIC); changing it restarts the listener
 - **Release update notice** — the dashboard checks GitHub Releases and shows a banner when a newer semver release is available
 - **Info tooltips** — hover over any card's info icon for an explanation of how to read that visual
 - **Local timezone** — all dates and times display in your browser's timezone
@@ -339,11 +347,12 @@ Mesh is now set up **from the dashboard**, not during installation. Open the das
 
 ### Enabling it (from the dashboard)
 
-Open the dashboard, click the **hamburger menu (☰)** to the left of the logo, and choose **“Configure Local Mesh Network.”** The configuration window:
+Open the dashboard, click the **hamburger menu (☰)** to the left of the logo (this opens the Settings modal), and switch to the **Mesh Network** tab — or just click the "peers connected" pill when you already belong to a mesh. The Mesh tab:
 
-- **Scans all local subnets on every enabled NIC** for existing mesh networks and lists any it finds, along with adjacent meshes that have at least one active node.
-- **Join an existing mesh:** pick a discovered mesh and enter the segment of its name that comes **after the final dash** (e.g. for `home-a1b2c3d4`, enter `a1b2c3d4`). This shared secret keeps unrelated meshes on the same LAN from accidentally merging.
+- **Scans all local subnets on every enabled NIC** for other Drachometer nodes. Nodes running *your* mesh are matched by id; nodes on other (or no) meshes are listed by address only — **a scan never reveals another mesh's id**, since the id is the only gate on every mesh endpoint.
+- **Join an existing mesh:** paste the mesh share string (`<mesh-id> <lan-ip>:<port>`) into the "Join by mesh id" box — the id, the address, or both, in one paste. Ask the mesh owner for theirs; it's one click to copy on their side. This shared secret keeps unrelated meshes on the same LAN from accidentally merging.
 - **Create a new mesh:** give it a name and a new mesh id like `home-a1b2c3d4` is generated.
+- **Listen interface:** choose which NIC/subnet accepts mesh connections (all interfaces, loopback only, or a detected address); applying a change restarts the listener.
 - **Leave:** stop replicating. History is preserved and your node identity is kept for re-joining later.
 
 Only **one mesh can be joined at a time** — joining or creating a mesh automatically leaves the current one, even if it has no active peers.
@@ -356,7 +365,7 @@ When you belong to a mesh, a small indicator appears just to the right of **Drac
 - a **sync icon** that animates while a sync round is in progress, plus the usual success/failure icons;
 - **`{n} peer(s) connected`.**
 
-Clicking any part of the indicator opens the same configuration window, which also shows mesh details: active peers on the current network, adjacent meshes with at least one active node, current-mesh uptime, and the mean time between a new record and its complete propagation to all active nodes (rolling window of the last 15 records).
+Clicking any part of the indicator opens the Settings modal on the Mesh tab, which also shows mesh details: active peers on the current network, your one-click share string (mesh id + this machine's address), the current listen binding, current-mesh uptime, and the mean time between a new record and its complete propagation to all active nodes (rolling window of the last 15 records).
 
 ### Command line (optional)
 
@@ -382,6 +391,27 @@ python "$HOME/.claude/hooks/drachometer/drachometer_mesh.py" compact --dry-run  
 python "$HOME/.claude/hooks/drachometer/drachometer_mesh.py" migrate         # sync mesh schema metadata after upgrades
 python "$HOME/.claude/hooks/drachometer/drachometer_mesh.py" disable          # stop replicating (history preserved)
 ```
+
+### Self-test
+
+Verifies that the replication engine behaves according to spec by simulating a complete two-node mesh — handshake, discovery, and bidirectional record exchange — entirely in a sandbox:
+
+```powershell
+python "$HOME/.claude/hooks/drachometer/drachometer_mesh.py" self-test        # human-readable check report
+python "$HOME/.claude/hooks/drachometer/drachometer_mesh.py" self-test --json # machine-readable report (exit code 0/1)
+```
+
+The simulation is fully self-contained and headless: both simulated nodes run the real mesh HTTP handler on ephemeral loopback ports with throwaway databases in a temp directory and a throwaway mesh id. Your real database, mesh configuration, and mesh log are never read or written, so it is safe to run whether mesh is enabled, disabled, or unconfigured. It runs in well under a second and checks, among other things:
+
+- anonymous discovery never reveals a mesh id, and a presented id matches only for the right mesh;
+- the handshake proves node identity, and every data endpoint rejects a wrong mesh id (403);
+- initial sync converges both nodes' oplogs in both directions, and replicated turns project faithfully;
+- new records emitted mid-test propagate, with tool calls linked to their turns;
+- last-writer-wins (a newer update replaces, a stale one is suppressed) and re-syncing applies nothing;
+- reserved `__dunder__` session ids never materialize on peers;
+- every stored event's id equals its content hash, and an event with a forged id is refused end-to-end.
+
+A failed check prints the specifics; use `--json` in scripts or CI (the command exits non-zero on any failure).
 
 ### Phase 2 hardening
 
