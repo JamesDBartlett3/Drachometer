@@ -1643,7 +1643,7 @@
         const rows = sorted
           .map(
             (s) => `<tr>
-      <td class="mono">${s.session_id.slice(0, 12)}...</td>
+      <td class="mono">${esc(s.session_id.slice(0, 12))}...</td>
       <td class="mono">${esc(shortModel(s.model))}</td>
       <td class="mono" title="${esc(s.cwd)}">${shortPath(s.cwd)}</td>
       <td class="mono">${esc(s.git_branch)}</td>
@@ -1689,7 +1689,7 @@
       <td class="mono">${esc(shortModel(t.model))}</td>
       <td class="mono" title="${esc(t.cwd)}">${shortPath(t.cwd)}</td>
       <td class="mono">${esc(t.git_branch)}</td>
-      <td>${t.stop_reason || ""}</td>
+      <td>${esc(t.stop_reason)}</td>
       <td class="right">${fmt(t.input_tokens)}</td>
       <td class="right">${fmt(t.output_tokens)}</td>
       <td class="right">${fmt(t.cache_read_tokens)}</td>

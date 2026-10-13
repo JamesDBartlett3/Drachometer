@@ -125,6 +125,11 @@ class TranscriptParsingTest(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.tmp = Path(self._tmp.name)
+        # The incremental turn counter persists per-transcript state; keep
+        # tests away from the real ~/.claude file.
+        self._orig_state_path = hook.TURN_STATE_PATH
+        hook.TURN_STATE_PATH = self.tmp / "turn-state.json"
+        self.addCleanup(setattr, hook, "TURN_STATE_PATH", self._orig_state_path)
 
     def _transcript(self, lines: list[str]) -> str:
         p = self.tmp / "transcript.jsonl"
@@ -259,6 +264,104 @@ class PurgeOldRecordsTest(unittest.TestCase):
                     self.assertEqual(conn.execute("SELECT COUNT(*) FROM tool_calls").fetchone()[0], 1)
                 finally:
                     conn.close()
+
+    def test_positive_window_also_purges_oplog_and_records_watermark(self):
+        # Regression: the oplog was never purged, so mesh gossip re-fed (and
+        # re-projected) deleted turns/tool_calls -- purged history resurrected.
+        conn = self._seeded_conn()
+        try:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS mesh_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            now = datetime.now(timezone.utc)
+            old = (now - timedelta(days=40)).isoformat()
+            recent = (now - timedelta(days=1)).isoformat()
+            for i, created in enumerate((old, recent)):
+                conn.execute(
+                    "INSERT INTO oplog (event_id, origin_node, lamport, created_at, entity, op, payload)"
+                    " VALUES (?, 'n', ?, ?, 'turn', 'upsert', '{}')",
+                    (f"e-{i}", i, created),
+                )
+            conn.commit()
+            hook.purge_old_records(conn, 30)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM oplog").fetchone()[0], 1)
+            watermark = conn.execute(
+                "SELECT value FROM mesh_meta WHERE key = 'compaction_watermark'").fetchone()
+            self.assertIsNotNone(watermark)
+            # The watermark is the purge cutoff: strictly newer than the deleted
+            # event, not newer than "now" -- anti-entropy skips everything below it.
+            self.assertGreater(watermark[0], old)
+            self.assertLessEqual(watermark[0], now.isoformat())
+        finally:
+            conn.close()
+
+    def test_purge_without_mesh_tables_still_purges_base_tables(self):
+        # A pre-mesh database has no oplog/mesh_meta; purging must not fail.
+        conn = self._seeded_conn()
+        try:
+            hook.purge_old_records(conn, 30)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM turns").fetchone()[0], 1)
+        finally:
+            conn.close()
+
+
+class IncrementalTurnCountTest(unittest.TestCase):
+    """_count_user_messages must keep O(delta) cost per PostToolUse and stay
+    count-consistent with get_transcript_info across appends."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tmp = Path(self._tmp.name)
+        self._orig_state_path = hook.TURN_STATE_PATH
+        hook.TURN_STATE_PATH = self.tmp / "turn-state.json"
+        self.addCleanup(setattr, hook, "TURN_STATE_PATH", self._orig_state_path)
+
+    def _write(self, text: str) -> Path:
+        p = self.tmp / "transcript.jsonl"
+        p.write_text(text, encoding="utf-8")
+        return p
+
+    def _user_line(self, content: str) -> str:
+        return line({"type": "user", "message": {"role": "user", "content": content}})
+
+    def test_counts_stay_consistent_across_appends(self):
+        p = self._write(self._user_line("a") + "\n")
+        self.assertEqual(hook._count_user_messages(str(p)), 1)
+        # Tool call appends an assistant line, then a second turn starts.
+        with p.open("a", encoding="utf-8") as fh:
+            fh.write(assistant_line("msg-1", "claude-opus-5-5",
+                                    {"input_tokens": 1, "output_tokens": 1,
+                                     "cache_read_input_tokens": 0,
+                                     "cache_creation_input_tokens": 0}) + "\n")
+        self.assertEqual(hook._count_user_messages(str(p)), 1)
+        with p.open("a", encoding="utf-8") as fh:
+            fh.write(self._user_line("b") + "\n")
+        self.assertEqual(hook._count_user_messages(str(p)), 2)
+
+        # A full parse (the Stop path) must agree with the incremental count.
+        self.assertEqual(hook.get_transcript_info(str(p))["turn_count"], 2)
+
+    def test_trailing_partial_line_is_not_counted_and_not_skipped(self):
+        p = self._write(self._user_line("a") + "\n")
+        self.assertEqual(hook._count_user_messages(str(p)), 1)
+        # Concurrently-written transcript: an incomplete line hangs at the end.
+        with p.open("a", encoding="utf-8") as fh:
+            fh.write('{"type": "user", "mess')
+        self.assertEqual(hook._count_user_messages(str(p)), 1)
+        # The line completes; the same region must be re-read, not skipped.
+        with p.open("a", encoding="utf-8") as fh:
+            fh.write('age": {"role": "user", "content": "b"}}\n')
+        self.assertEqual(hook._count_user_messages(str(p)), 2)
+
+    def test_truncated_or_new_transcript_falls_back_to_full_parse(self):
+        p = self._write(self._user_line("a") + "\n" + self._user_line("b") + "\n")
+        self.assertEqual(hook._count_user_messages(str(p)), 2)
+        p.write_text(self._user_line("c") + "\n", encoding="utf-8")
+        self.assertEqual(hook._count_user_messages(str(p)), 1)
+
+    def test_derive_turn_id_uses_the_incremental_count(self):
+        p = self._write(self._user_line("a") + "\n" + self._user_line("b") + "\n")
+        self.assertEqual(hook.derive_turn_id({"transcript_path": str(p)}), "turn-2")
 
 
 if __name__ == "__main__":

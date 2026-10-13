@@ -31,6 +31,10 @@ except Exception:
 DB_PATH = Path.home() / ".claude" / "drachometer.db"
 SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
 LOG_PATH = Path.home() / ".claude" / "drachometer-hook.log"
+# Running user-message counts per transcript, so the hot PostToolUse path does
+# not re-read and re-parse the whole (unboundedly growing) transcript on every
+# tool call. Only the tail appended since the last hook run is parsed.
+TURN_STATE_PATH = Path.home() / ".claude" / "drachometer-turn-state.json"
 LEGACY_DASHBOARD_SERVER = Path.home() / ".claude" / "hooks" / "drachometer-serve-report.py"
 DASHBOARD_SERVER = Path.home() / ".claude" / "hooks" / "drachometer" / "drachometer-serve-dashboard.py"
 DASHBOARD_PORT = 9873
@@ -112,6 +116,22 @@ def purge_old_records(conn: sqlite3.Connection, retention_days: int) -> None:
     cutoff = (datetime.now(timezone.utc) - timedelta(days=retention_days)).isoformat()
     conn.execute("DELETE FROM tool_calls WHERE recorded_at < ?", (cutoff,))
     conn.execute("DELETE FROM turns WHERE recorded_at < ?", (cutoff,))
+    # The oplog must age out on the same window: it re-projects deleted
+    # turns/tool_calls on the next mesh gossip round (a peer still holding the
+    # events would re-feed them). Recording the watermark also tells
+    # anti-entropy never to re-pull events this old from peers.
+    try:
+        conn.execute("DELETE FROM oplog WHERE created_at < ?", (cutoff,))
+        # Advance-only watermark (never moves back if retention is loosened
+        # later); same key/upsert as drachometer_mesh.record_compaction_watermark.
+        conn.execute(
+            """INSERT INTO mesh_meta(key, value) VALUES ('compaction_watermark', ?)
+               ON CONFLICT(key) DO UPDATE SET value = excluded.value
+               WHERE excluded.value > mesh_meta.value""",
+            (cutoff,),
+        )
+    except sqlite3.OperationalError:
+        pass  # pre-mesh database without oplog/mesh_meta; nothing to age out
     conn.commit()
 
 
@@ -212,6 +232,86 @@ def get_git_branch(cwd: str) -> str | None:
         return None
 
 
+def _load_turn_state() -> dict:
+    try:
+        state = json.loads(TURN_STATE_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, ValueError):
+        return {}
+    return state if isinstance(state, dict) else {}
+
+
+def _save_turn_state(state: dict) -> None:
+    # Entries are per transcript path; cap the file by dropping the oldest
+    # half (dict order approximates least-recently-used: live sessions are
+    # re-inserted on every update).
+    # ponytail: a lost/corrupted state file is self-healing (the next count
+    # falls back to a full parse), so no locking or fsync here.
+    if len(state) > 512:
+        state = dict(list(state.items())[-256:])
+    tmp = TURN_STATE_PATH.with_name(f"{TURN_STATE_PATH.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(json.dumps(state), encoding="utf-8")
+        os.replace(tmp, TURN_STATE_PATH)
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
+def _count_user_messages(transcript: str) -> int | None:
+    """Count user messages in a transcript, incrementally.
+
+    PostToolUse fires per tool call and used to re-read and JSON-parse the
+    entire transcript each time -- O(session length) per call, seconds of
+    stall on long agentic sessions. Persists (byte offset, count) per
+    transcript path, so when the file has only grown (the normal case) only
+    the appended tail is parsed; truncation/rotation falls back to a full
+    parse. Counting rules are identical to get_transcript_info's so the
+    turn-N ids stay consistent between PostToolUse and Stop.
+    """
+    p = Path(transcript)
+    try:
+        size = p.stat().st_size
+    except OSError:
+        return None
+    state = _load_turn_state()
+    entry = state.get(str(p))
+    offset = entry.get("offset", 0) if isinstance(entry, dict) else 0
+    count = entry.get("count", 0) if isinstance(entry, dict) else 0
+    if not isinstance(offset, int) or not isinstance(count, int) or not 0 <= offset <= size:
+        offset, count = 0, 0
+    try:
+        with p.open("rb") as fh:
+            fh.seek(offset)
+            tail = fh.read()
+    except OSError as exc:
+        hook_log("transcript read failed", level="warning", error=str(exc),
+                 transcript=transcript)
+        return None
+    # Count complete lines only: the transcript is being written concurrently,
+    # and a trailing partial line must be re-read (not skipped) next time.
+    nl = tail.rfind(b"\n")
+    if nl == -1:
+        complete, consumed = b"", 0  # nothing newline-terminated yet
+    else:
+        complete, consumed = tail[: nl + 1], nl + 1
+    for line in complete.decode("utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if not line or '"type"' not in line:
+            continue
+        try:
+            obj = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(obj, dict) and obj.get("type") == "user":
+            count += 1
+    if consumed or entry is None:
+        state[str(p)] = {"offset": offset + consumed, "count": count}
+        _save_turn_state(state)
+    return count
+
+
 def derive_turn_id(payload: dict, turn_count: int | None = None) -> str:
     """Stable per-turn ID: ``turn-<user message count>``.
 
@@ -219,7 +319,8 @@ def derive_turn_id(payload: dict, turn_count: int | None = None) -> str:
     the string '"type":"user"' appearing inside tool output or assistant
     content is not mis-counted as a user message boundary. Callers that have
     already parsed the transcript (Stop hooks) pass ``turn_count`` so the
-    file is never read twice.
+    file is never read twice; everyone else pays only for the transcript
+    tail appended since the previous hook run.
     """
     turn_id = payload.get("turn_id")
     if turn_id:
@@ -228,24 +329,7 @@ def derive_turn_id(payload: dict, turn_count: int | None = None) -> str:
     if turn_count is None:
         transcript = payload.get("transcript_path", "")
         if transcript:
-            try:
-                p = Path(transcript)
-                if p.exists():
-                    count = 0
-                    for line in p.read_text(encoding="utf-8").splitlines():
-                        line = line.strip()
-                        if not line or '"type"' not in line:
-                            continue
-                        try:
-                            obj = json.loads(line)
-                            if isinstance(obj, dict) and obj.get("type") == "user":
-                                count += 1
-                        except (json.JSONDecodeError, ValueError):
-                            pass
-                    turn_count = count
-            except Exception as exc:
-                hook_log("transcript read failed", level="warning", error=str(exc),
-                         transcript=transcript)
+            turn_count = _count_user_messages(transcript)
     if turn_count:
         return f"turn-{turn_count}"
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")

@@ -154,7 +154,10 @@ def request_server_shutdown(timeout: float = 3.0) -> bool:
     try:
         req = urllib.request.Request(
             f"http://127.0.0.1:{DASHBOARD_PORT}/shutdown", data=b"{}",
-            headers={"Content-Type": "application/json"}, method="POST",
+            # The server rejects POSTs without same-origin evidence (CSRF
+            # guard); urllib is not a browser, so we must declare it.
+            headers={"Content-Type": "application/json",
+                     "Origin": f"http://127.0.0.1:{DASHBOARD_PORT}"}, method="POST",
         )
         with urllib.request.urlopen(req, timeout=timeout):
             return True
@@ -281,10 +284,7 @@ def migrate_settings_for_server_changes() -> bool:
         hooks[event] = new_groups
 
     if changed:
-        SETTINGS_PATH.write_text(
-            json.dumps(settings, indent=2, ensure_ascii=False) + "\n",
-            encoding="utf-8",
-        )
+        common.write_json_atomic(SETTINGS_PATH, settings)
         print("  Migrated hook settings for HTTP server behavior")
     return changed
 
@@ -321,16 +321,31 @@ def apply_sql_migrations() -> None:
             if not row:
                 print(f"  Applying SQL migration: {version}")
                 try:
-                    conn.executescript(sql_file.read_text(encoding="utf-8"))
+                    # Statement-by-statement instead of executescript so a
+                    # redundant ALTER ... ADD COLUMN (SQLite has no IF NOT
+                    # EXISTS for columns; ensure_base_schema may have added
+                    # it already) is tolerated without abandoning the rest
+                    # of the file. Migrations are repo-controlled plain DDL
+                    # with no semicolons inside string literals.
+                    # ponytail: if a migration ever embeds ';' in a string,
+                    # replace split(";") with a real statement splitter.
+                    for statement in filter(None, (s.strip() for s in sql_file.read_text(encoding="utf-8").split(";"))):
+                        try:
+                            conn.execute(statement)
+                        except sqlite3.OperationalError as exc:
+                            if "duplicate column name" not in str(exc).lower():
+                                raise
                     conn.execute("INSERT INTO schema_migrations (version) VALUES (?)", (version,))
                     conn.commit()
                 except Exception as e:
                     # Don't abort the whole install: init_database() runs next and
                     # brings the schema to the current version via its own idempotent
-                    # logic. Leave this migration unrecorded so it retries later.
+                    # logic. Leave this migration unrecorded so it retries later,
+                    # but keep applying subsequent migrations -- one broken file
+                    # must not permanently block 003+.
                     print(f"  WARNING: could not apply SQL migration {version}: {e}")
                     print("  Continuing; database initialization will ensure the current schema.")
-                    break
+                    continue
 
 
 def run_install_migrations(installed_version: str) -> None:
@@ -465,11 +480,36 @@ def build_hook_commands(python_exe: str) -> dict:
     }
 
 
-def merge_settings(python_exe: str) -> None:
-    if SETTINGS_PATH.exists():
+def read_settings_or_exit() -> dict:
+    """Read ~/.claude/settings.json, aborting with a clear message if it
+    exists but cannot be parsed.
+
+    This is the guard every other settings read lacked: a malformed file must
+    stop the install *before* hooks are copied, not leave a half-installed
+    state (hooks on disk, nothing registered) with a traceback.
+    """
+    if not SETTINGS_PATH.exists():
+        return {}
+    try:
         settings = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
-    else:
-        settings = {}
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        print(f"ERROR: {SETTINGS_PATH} exists but could not be read as JSON: {exc}")
+        print("Fix or remove the file, then re-run the installer.")
+        sys.exit(1)
+    if not isinstance(settings, dict):
+        print(f"ERROR: {SETTINGS_PATH} does not contain a JSON object.")
+        print("Fix or remove the file, then re-run the installer.")
+        sys.exit(1)
+    return settings
+
+
+def check_settings_readable() -> None:
+    """Fail fast, before any file is copied, when settings.json is unreadable."""
+    read_settings_or_exit()
+
+
+def merge_settings(python_exe: str) -> None:
+    settings = read_settings_or_exit()
 
     hooks = settings.setdefault("hooks", {})
     new_hooks = build_hook_commands(python_exe)
@@ -493,10 +533,7 @@ def merge_settings(python_exe: str) -> None:
             hooks[event] = existing
             print(f"  Added {event} hook")
 
-    SETTINGS_PATH.write_text(
-        json.dumps(settings, indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
-    )
+    common.write_json_atomic(SETTINGS_PATH, settings)
 
 
 def init_database() -> None:
@@ -614,6 +651,10 @@ def main(argv=None) -> None:
 
     print("\n[1/8] Checking for a running instance...")
     check_running_instance(args)
+
+    # Before anything is copied: an unreadable settings.json must abort the
+    # install cleanly, not leave hooks copied but unregistered.
+    check_settings_readable()
 
     print("\n[2/8] Finding Python...")
     python_exe = find_python()

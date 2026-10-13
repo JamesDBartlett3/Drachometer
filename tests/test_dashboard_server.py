@@ -2,6 +2,7 @@
 """Tests for the dashboard server's repository-root resolution (the backend
 of the Repositories tab's group-by-repo-root behavior)."""
 
+import email.message
 import importlib.util
 import json
 import shutil
@@ -201,6 +202,104 @@ class PreferencesTest(unittest.TestCase):
         result = self._write({"token_usage_retention_days": "-5"})
         self.assertFalse(result["ok"])
         self.assertNotIn("token_usage_retention_days", self._stored())
+
+    def test_write_is_atomic_and_snapshots_previous_settings(self):
+        # Regression: settings.json used to be truncate-then-written, so a
+        # crash mid-write lost the whole file (hooks, permissions, ...).
+        server.SETTINGS_PATH.write_text('{"keep": true}\n', encoding="utf-8")
+        self.assertTrue(self._write({"group_repos_by_name": True})["ok"])
+        self.assertTrue(self._stored()["group_repos_by_name"])
+        backup = server.SETTINGS_PATH.parent / "settings.json.bak"
+        self.assertEqual(json.loads(backup.read_text(encoding="utf-8")), {"keep": True})
+        # No temp-file litter left behind.
+        leftovers = list(server.SETTINGS_PATH.parent.glob("settings.json.*.tmp"))
+        self.assertEqual(leftovers, [])
+
+
+class RequestProvenanceTest(unittest.TestCase):
+    """The loopback API must reject browser-borne cross-site traffic: a Host
+    allowlist on everything (DNS-rebinding defense) plus same-origin evidence
+    on POSTs and the DB download (CSRF defense)."""
+
+    def _handler(self, headers: dict, path: str = "/shutdown"):
+        handler = server.Handler.__new__(server.Handler)
+        msg = email.message.Message()
+        for key, value in headers.items():
+            msg[key] = value
+        handler.headers = msg
+        handler.path = path
+        return handler
+
+    def test_host_allowlist(self):
+        for host in ("127.0.0.1:9873", "localhost:9873"):
+            with self.subTest(host=host):
+                self.assertTrue(self._handler({"Host": host})._host_allowed())
+        for host in (None, "evil.example:9873", "127.0.0.1:1", "[::1]:9873"):
+            with self.subTest(host=host):
+                headers = {} if host is None else {"Host": host}
+                self.assertFalse(self._handler(headers)._host_allowed())
+
+    def test_same_origin_evidence(self):
+        ok = (
+            {"Origin": "http://127.0.0.1:9873"},
+            {"Origin": "http://localhost:9873"},
+            {"Sec-Fetch-Site": "same-origin"},
+        )
+        for headers in ok:
+            with self.subTest(headers=headers):
+                self.assertTrue(self._handler(headers)._same_origin())
+        bad = (
+            {},
+            {"Origin": "http://evil.example"},
+            {"Origin": "null"},
+            {"Sec-Fetch-Site": "cross-site"},
+            {"Sec-Fetch-Site": "same-site"},
+            {"Sec-Fetch-Site": "none"},
+            {"Host": "127.0.0.1:9873"},  # Host alone is not origin evidence
+        )
+        for headers in bad:
+            with self.subTest(headers=headers):
+                self.assertFalse(self._handler(headers)._same_origin())
+
+    def test_do_POST_rejects_foreign_host_and_missing_same_origin(self):
+        errors = []
+
+        def record_error(code, *args, **kwargs):
+            errors.append(code)
+
+        attacker = self._handler({"Host": "evil.example:9873"})
+        attacker.send_error = record_error
+        attacker.do_POST()
+        self.assertEqual(errors, [403])
+
+        # Right host but no browser same-origin evidence (no Origin header):
+        # a no-preflight CSRF POST must not reach the routing dispatch.
+        csrf = self._handler({"Host": "127.0.0.1:9873",
+                              "Content-Type": "application/json",
+                              "Content-Length": "34"})
+        csrf.send_error = record_error
+        csrf.do_POST()
+        self.assertEqual(errors, [403, 403])
+
+    def test_do_GET_blocks_cross_origin_db_download(self):
+        errors = []
+
+        def record_error(code, *args, **kwargs):
+            errors.append(code)
+
+        rebinded = self._handler({"Host": "evil.example:9873"}, path="/drachometer.db")
+        rebinded.send_error = record_error
+        rebinded.do_GET()
+        self.assertEqual(errors, [403])
+
+        # Right host, but fetched cross-site (DNS rebinding from another page
+        # on the same registrable domain): no same-origin evidence -> 403.
+        cross_site = self._handler({"Host": "127.0.0.1:9873",
+                                    "Sec-Fetch-Site": "cross-site"},
+                                   path="/drachometer.db")
+        cross_site.send_error = record_error
+        cross_site.do_GET()
+        self.assertEqual(errors, [403, 403])
 
 
 if __name__ == "__main__":

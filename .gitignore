@@ -2,3 +2,7 @@ __pycache__/
 *.py[cod]
 .env
 .video_agent/**
+
+# ZCode agent state (workflow drafts, run journals) and its generated ignore file
+.zcode/
+.zcodeignore

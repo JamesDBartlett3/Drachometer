@@ -36,6 +36,19 @@ try:
 except Exception:
     mesh = None
 
+# Shared atomic settings.json writer (ships in the same install directory).
+import drachometer_common as common  # noqa: E402
+
+# -- request provenance ------------------------------------------------------ #
+# The server binds 127.0.0.1 only, but the browser is the vector: any web page
+# in any local browser can no-preflight-POST these endpoints (CSRF), and DNS
+# rebinding makes an attacker's page *be* a same-host client with a hostile
+# Host header. So every request must carry a loopback Host, and everything a
+# browser could send (all POSTs, the DB download) must additionally prove
+# same-origin. This closes the origin check deferred in todo.md.
+_ALLOWED_HOSTS = {f"127.0.0.1:{PORT}", f"localhost:{PORT}"}
+_ALLOWED_ORIGINS = {f"http://127.0.0.1:{PORT}", f"http://localhost:{PORT}"}
+
 
 # -- repository root + full-name resolution (for the Repositories tab) ------- #
 # The dashboard groups usage by repository root rather than raw cwd, so a
@@ -236,6 +249,28 @@ class Handler(SimpleHTTPRequestHandler):
         except (json.JSONDecodeError, ValueError):
             return {}
 
+    def _host_allowed(self) -> bool:
+        return self.headers.get("Host", "") in _ALLOWED_HOSTS
+
+    def _same_origin(self) -> bool:
+        """True when the request provably originates from the dashboard page.
+
+        Browsers attach ``Sec-Fetch-Site`` to every request and ``Origin`` to
+        (at least) all POSTs, so a cross-site page fails both checks. A request
+        with neither header cannot come from a browser and is rejected too --
+        non-browser callers (the installer, curl) must send ``Origin``.
+        ponytail: this also blocks direct address-bar downloads of
+        /drachometer.db (``Sec-Fetch-Site: none``) and pre-2020 browsers
+        without Fetch Metadata; the dashboard needs a modern browser anyway.
+        """
+        origin = self.headers.get("Origin")
+        if origin is not None:
+            return origin in _ALLOWED_ORIGINS
+        site = self.headers.get("Sec-Fetch-Site")
+        if site is not None:
+            return site == "same-origin"
+        return False
+
     # -- user preferences (stored in ~/.claude/settings.json) --------------- #
     # The retention key lives at the top level of settings.json because that is
     # where the hook already looks for it (token_usage_retention_days).
@@ -284,9 +319,7 @@ class Handler(SimpleHTTPRequestHandler):
                     settings.pop(key, None)
                 else:
                     settings[key] = value
-            SETTINGS_PATH.write_text(
-                json.dumps(settings, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
-            )
+            common.write_json_atomic(SETTINGS_PATH, settings)
         except OSError as exc:
             return {"ok": False, "error": str(exc)}
         return {"ok": True, **updates}
@@ -294,6 +327,13 @@ class Handler(SimpleHTTPRequestHandler):
     # -- routing ------------------------------------------------------------ #
     def do_GET(self):
         path = self.path.split("?")[0]
+
+        if not self._host_allowed():
+            self.send_error(403, "Forbidden host")
+            return
+        if path == "/drachometer.db" and not self._same_origin():
+            self.send_error(403, "Cross-origin database download")
+            return
 
         if path == "/drachometer.db":
             if DB_PATH.exists():
@@ -363,6 +403,13 @@ class Handler(SimpleHTTPRequestHandler):
 
     def do_POST(self):
         path = self.path.split("?")[0]
+
+        if not self._host_allowed():
+            self.send_error(403, "Forbidden host")
+            return
+        if not self._same_origin():
+            self.send_error(403, "Cross-origin request")
+            return
 
         if path == "/shutdown":
             self._send_json({"ok": True, "stopping": True})

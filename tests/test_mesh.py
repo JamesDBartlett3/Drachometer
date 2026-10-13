@@ -319,6 +319,82 @@ class TestEventIdentity(MeshTestBase):
         self.assertEqual(conn.execute("SELECT COUNT(*) FROM oplog").fetchone()[0], 0)
         conn.close()
 
+    def _turn_event(self, **overrides):
+        payload = {"session_id": "s1", "turn_id": "turn-1",
+                   "recorded_at": "2026-06-26T12:00:00+00:00", "stop_reason": "end_turn",
+                   "input_tokens": 1, "output_tokens": 1, "cache_read_tokens": 0,
+                   "cache_creation_tokens": 0, "cwd": None, "git_branch": None,
+                   "model_key": "claude-opus-4-8"}
+        payload.update(overrides)
+        return {"event_id": mesh.event_id_for("turn", mesh._canonical(payload)),
+                "origin_node": "n", "lamport": 1, "created_at": payload["recorded_at"],
+                "entity": "turn", "op": "upsert", "payload": payload}
+
+    def test_hash_valid_event_with_wrong_typed_payload_field_is_rejected(self):
+        # A buggy/version-mismatched peer can emit a hash-valid event whose
+        # payload types are wrong; it used to raise mid-projection and roll
+        # back the whole sync batch, permanently halting replication.
+        dst = self.tmp / "dst.db"
+        conn = sqlite3.connect(dst)
+        conn.executescript(BASE_SCHEMA)
+        mesh.ensure_schema(conn)
+        for bad in ({"model_key": {"tier": "opus"}}, {"session_id": None},
+                    {"input_tokens": {"n": 1}}, {"stop_reason": ["end_turn"]}):
+            with self.subTest(bad=bad):
+                self.assertFalse(mesh.apply_event(conn, self._turn_event(**bad)))
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM oplog").fetchone()[0], 0)
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM turns").fetchone()[0], 0)
+        conn.close()
+
+    def test_hash_valid_event_with_non_dict_payload_is_rejected(self):
+        # The payload JSON string can decode to any JSON value; a non-dict used
+        # to raise AttributeError in the well-typed check (payload.get) and
+        # crash-loop the sync batch. Must be rejected like a bad hash.
+        dst = self.tmp / "dst.db"
+        conn = sqlite3.connect(dst)
+        conn.executescript(BASE_SCHEMA)
+        mesh.ensure_schema(conn)
+        for decoded in (["not", "a", "dict"], "just a string", 42, None):
+            ev = {"event_id": mesh.event_id_for("turn", mesh._canonical(decoded)),
+                  "origin_node": "n", "lamport": 1,
+                  "created_at": "2026-06-26T00:00:00+00:00",
+                  "entity": "turn", "op": "upsert", "payload": json.dumps(decoded)}
+            with self.subTest(decoded=decoded):
+                self.assertFalse(mesh.apply_event(conn, ev))
+        # Same crash-loop class through the op envelope field: op sits outside
+        # the content hash and is bound into the oplog INSERT.
+        for bad_op in ({"smuggled": True}, [1, 2], None):
+            ev = self._turn_event()
+            ev["op"] = bad_op
+            with self.subTest(bad_op=bad_op):
+                self.assertFalse(mesh.apply_event(conn, ev))
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM oplog").fetchone()[0], 0)
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM turns").fetchone()[0], 0)
+        conn.close()
+
+    def test_projection_failure_keeps_oplog_insert_and_skips_projection(self):
+        dst = self.tmp / "dst.db"
+        conn = sqlite3.connect(dst)
+        conn.executescript(BASE_SCHEMA)
+        mesh.ensure_schema(conn)
+        original = mesh._project_turn
+
+        def boom(conn, p):
+            raise RuntimeError("projection exploded")
+
+        mesh._project_turn = boom
+        try:
+            applied = mesh.apply_event(conn, self._turn_event())
+        finally:
+            mesh._project_turn = original
+        conn.commit()
+        self.assertFalse(applied)
+        # The event stays in the oplog (never re-fetched); only the
+        # turns/tool_calls projection was skipped.
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM oplog").fetchone()[0], 1)
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM turns").fetchone()[0], 0)
+        conn.close()
+
     def test_peer_registry_rejects_invalid_advertise_addresses(self):
         registry = mesh._PeerRegistry({"peers": []})
         for bad in ("no-port", ":9874", "host:", "host:99999", "bad host:9874", 12345, ""):
@@ -397,6 +473,115 @@ class TestMeshPhaseTwoFeatures(MeshTestBase):
         self.assertEqual(metrics["alert"], "unreachable peers")
         self.assertIn("dedupe_rate", metrics)
         self.assertIn("conflict_rate", metrics)
+
+
+class TestCompactionWatermark(MeshTestBase):
+    """Retention must be sticky: once events are purged, anti-entropy must
+    never re-pull them from a peer that still holds copies."""
+
+    def _seed_oplog(self, db: Path, events: list[tuple[str, str]]):
+        conn = sqlite3.connect(db)
+        conn.executescript(BASE_SCHEMA)
+        mesh.ensure_schema(conn)
+        for i, (event_id, created_at) in enumerate(events):
+            conn.execute(
+                "INSERT INTO oplog (event_id, origin_node, lamport, created_at, entity, op, payload)"
+                " VALUES (?, 'nodeX', ?, ?, 'turn', 'upsert', '{}')",
+                (event_id, i, created_at),
+            )
+        conn.commit()
+        return conn
+
+    def test_watermark_is_advance_only(self):
+        db = self.tmp / "wm.db"
+        conn = self._seed_oplog(db, [])
+        try:
+            self.assertIsNone(mesh.compaction_watermark(conn))
+            mesh.record_compaction_watermark(conn, "2026-06-20T00:00:00+00:00")
+            # Loosening retention later must not move the watermark back.
+            mesh.record_compaction_watermark(conn, "2026-06-01T00:00:00+00:00")
+            self.assertEqual(mesh.compaction_watermark(conn), "2026-06-20T00:00:00+00:00")
+            mesh.record_compaction_watermark(conn, "2026-06-25T00:00:00+00:00")
+            self.assertEqual(mesh.compaction_watermark(conn), "2026-06-25T00:00:00+00:00")
+        finally:
+            conn.close()
+
+    def test_compact_oplog_records_watermark(self):
+        db = self.tmp / "compact-wm.db"
+        old_ts = (datetime.now(timezone.utc) - timedelta(days=10)).isoformat()
+        new_ts = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+        conn = self._seed_oplog(db, [("old-1", old_ts), ("new-1", new_ts)])
+        try:
+            mesh.compact_oplog({"retention_days": 3, "retention_keep_per_origin": 1}, db_path=db)
+        finally:
+            conn.close()
+        conn = sqlite3.connect(db)
+        try:
+            self.assertGreater(mesh.compaction_watermark(conn), old_ts)
+        finally:
+            conn.close()
+
+    def _event_ids_response(self, db: Path, query: str) -> dict:
+        handler_cls = mesh._make_mesh_handler(
+            {"mesh_id": "m", "enabled": True},
+            mesh._PeerRegistry({"peers": []}),
+            "test",
+            db_path=db,
+        )
+        handler = handler_cls.__new__(handler_cls)
+        handler.path = query
+        sent = {}
+        handler._send_json = lambda obj, status=200, compress=None: sent.update(obj=obj, status=status)
+        handler._require_mesh_id = lambda presented: True
+        handler.do_GET()
+        return sent["obj"]
+
+    def test_event_ids_respects_since_watermark(self):
+        db = self.tmp / "ids.db"
+        conn = self._seed_oplog(db, [
+            ("purged-1", "2026-06-01T00:00:00+00:00"),
+            ("kept-1", "2026-06-26T00:00:00+00:00"),
+        ])
+        conn.close()
+        without = self._event_ids_response(db, "/mesh/event-ids?mesh_id=m&origin=nodeX")
+        self.assertEqual(sorted(without["ids"]), ["kept-1", "purged-1"])  # old peers unaffected
+        with_since = self._event_ids_response(
+            db, "/mesh/event-ids?mesh_id=m&origin=nodeX&since=2026-06-15T00:00:00%2B00:00")
+        self.assertEqual(with_since["ids"], ["kept-1"])  # purged events are never re-offered
+
+    def test_sync_with_peer_passes_local_watermark(self):
+        db_a = self.tmp / "a.db"
+        conn = self._seed_oplog(db_a, [])
+        try:
+            # record_compaction_watermark leaves the transaction to the caller
+            # (same contract as emit_event); commit so close() doesn't roll it back.
+            mesh.record_compaction_watermark(conn, "2026-06-15T00:00:00+00:00")
+            conn.commit()
+        finally:
+            conn.close()
+        requested = []
+
+        def fake_get_json(peer, path, timeout=5.0):
+            requested.append(path)
+            if "/mesh/hello" in path:
+                return {"ok": True, "schema_version": mesh.SCHEMA_VERSION}
+            if "/mesh/digest" in path:
+                return {"origins": {"nodeX": 2}}
+            return {"ids": []}
+
+        orig_db = mesh.DB_PATH
+        orig_get = mesh._get_json
+        mesh.DB_PATH = db_a
+        mesh._get_json = fake_get_json
+        try:
+            mesh.sync_with_peer({"mesh_id": "m", "node_id": "nodeA", "peers": []},
+                                "127.0.0.1:9999")
+        finally:
+            mesh._get_json = orig_get
+            mesh.DB_PATH = orig_db
+        ids_paths = [p for p in requested if "/mesh/event-ids" in p]
+        self.assertTrue(ids_paths)
+        self.assertIn("since=2026-06-15T00", ids_paths[0])
 
 
 class TestTwoNodeConvergence(MeshTestBase):

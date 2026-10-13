@@ -16,8 +16,10 @@ copies all files into one place), so the copies can never diverge again.
 from __future__ import annotations
 
 import json
+import os
 import re
 import sqlite3
+import tempfile
 from pathlib import Path
 
 # Offline fallback pricing (USD per 1M tokens), kept in sync with
@@ -36,7 +38,7 @@ PRICING_KEYS = ("input", "output", "cache_read", "cache_create")
 # Bumped whenever ensure_base_schema() learns something new; the hook checks
 # PRAGMA user_version first so it can skip the (much larger) DDL path on every
 # invocation of a database this version of the schema has already prepared.
-SCHEMA_USER_VERSION = 1
+SCHEMA_USER_VERSION = 2
 
 MODEL_INSERT_SQL = """
 INSERT INTO models (
@@ -107,6 +109,7 @@ CREATE TABLE IF NOT EXISTS oplog (
 );
 CREATE INDEX IF NOT EXISTS idx_oplog_origin_lamport ON oplog(origin_node, lamport);
 CREATE INDEX IF NOT EXISTS idx_oplog_lamport        ON oplog(lamport);
+CREATE INDEX IF NOT EXISTS idx_oplog_created_at     ON oplog(created_at);
 """
 
 # Columns added after the schema above first shipped; ALTER ... ADD COLUMN is
@@ -237,3 +240,40 @@ def ensure_base_schema(conn: sqlite3.Connection, backfill_model_ids: bool = True
                 conn.execute("UPDATE turns SET model_id = ? WHERE id = ?", (model_id, turn_pk))
     conn.execute(f"PRAGMA user_version = {SCHEMA_USER_VERSION}")
     conn.commit()
+
+
+def write_json_atomic(path: Path, payload) -> None:
+    """Atomically (re)write a JSON config file, snapshotting the old version.
+
+    settings.json is read-modify-written by several tools (this app, Claude
+    Code itself, the installer). A truncate-then-write loses the *entire*
+    file -- hooks, permissions, every other tool's settings -- on a crash or
+    power loss mid-write. So: serialize to a temp file in the same directory
+    (same filesystem), fsync it, and os.replace() it over the target, which
+    is atomic on POSIX and Windows. The previous content is kept alongside
+    as ``<name>.bak`` so a bad write is recoverable by hand.
+
+    ponytail: Claude Code takes no cooperative lock, so a concurrent
+    read-modify-write can still lose the other writer's *keys* (last save
+    wins, prior content recoverable from ``<name>.bak``); true mutual
+    exclusion would require every writer -- including Claude Code -- to lock.
+    """
+    text = json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
+    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        try:
+            previous = path.read_text(encoding="utf-8")
+            Path(str(path) + ".bak").write_text(previous, encoding="utf-8")
+        except OSError:
+            pass  # snapshot is best-effort recovery aid, not the fix itself
+        os.replace(tmp_name, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise

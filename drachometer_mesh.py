@@ -577,6 +577,35 @@ def _reject_event(ev, reason: str) -> bool:
     return False
 
 
+# NOT NULL string keys each entity's projection inserts. Values beyond these
+# (token counts, optional text fields) only need to be JSON scalars to be
+# storable/projectable.
+_PAYLOAD_REQUIRED_STR: dict[str, set[str]] = {
+    "turn": {"session_id", "turn_id", "recorded_at"},
+    "tool_call": {"session_id", "turn_id", "recorded_at"},
+}
+_SCALAR_TYPES = (str, int, float, bool)
+
+
+def _payload_is_well_typed(entity: str, payload: dict) -> bool:
+    """Cheap structural check before the oplog insert.
+
+    A hash-valid event can still carry wrong-typed payload fields (a buggy or
+    version-mismatched peer): a dict/list/None where the projection expects a
+    string raises deep inside the sqlite write and used to roll back the whole
+    sync batch. Scalars-only, plus the NOT NULL string keys ``entity`` needs.
+    """
+    required = _PAYLOAD_REQUIRED_STR.get(entity)
+    if required is not None:
+        for key in required:
+            if not isinstance(payload.get(key), str):
+                return False
+    return all(
+        isinstance(value, _SCALAR_TYPES) or value is None
+        for value in payload.values()
+    )
+
+
 def apply_event(conn: sqlite3.Connection, ev: dict) -> bool:
     """Store a (possibly remote) event and project it. Returns True if new.
 
@@ -601,17 +630,31 @@ def apply_event(conn: sqlite3.Connection, ev: dict) -> bool:
         event_id = str(ev.get("event_id") or "")
     except (KeyError, TypeError, ValueError, json.JSONDecodeError):
         return _reject_event(ev, "malformed envelope")
+    if not isinstance(payload, dict):
+        # The payload JSON string can decode to any JSON value; a non-dict
+        # would raise AttributeError in the well-typed check below and (in
+        # sync_with_peer) roll back and crash-loop the whole batch.
+        return _reject_event(ev, "payload is not an object")
+    op = ev.get("op", "upsert")
+    if not isinstance(op, str):
+        # op sits outside the content hash (line below) and is bound into the
+        # oplog INSERT; a dict/list/None op would raise mid-batch there and
+        # crash-loop sync with the sending peer. None would also violate the
+        # oplog's NOT NULL.
+        return _reject_event(ev, "op must be a string")
     if not origin_node:
         return _reject_event(ev, "missing origin_node")
     if event_id != event_id_for(entity, _canonical(payload)):
         return _reject_event(ev, "event_id does not match payload hash")
+    if not _payload_is_well_typed(entity, payload):
+        return _reject_event(ev, "payload field types invalid")
     canonical = _canonical(payload)
     cur = conn.execute(
         """INSERT OR IGNORE INTO oplog
                (event_id, origin_node, lamport, created_at, entity, op, payload)
            VALUES (?, ?, ?, ?, ?, ?, ?)""",
         (event_id, origin_node, lamport, created_at,
-         entity, ev.get("op", "upsert"), canonical),
+         entity, op, canonical),
     )
     if cur.rowcount == 0:
         _record_metric("dedupes")
@@ -624,10 +667,24 @@ def apply_event(conn: sqlite3.Connection, ev: dict) -> bool:
         )
         return False
     projected = True
-    if ev["entity"] == "turn":
-        projected = _project_turn(conn, payload)
-    elif ev["entity"] == "tool_call":
-        projected = _project_tool_call(conn, payload)
+    try:
+        if entity == "turn":
+            projected = _project_turn(conn, payload)
+        elif entity == "tool_call":
+            projected = _project_tool_call(conn, payload)
+    except Exception as exc:
+        # One bad event must not roll back the whole sync batch: the oplog
+        # insert above stands (so the event is never re-fetched), only the
+        # projection into turns/tool_calls is skipped.
+        log(
+            "event projection failed; kept in oplog, projection skipped",
+            level="warning",
+            event="projection_error",
+            entity=entity,
+            event_id=event_id,
+            error=str(exc),
+        )
+        projected = False
     if not projected:
         log(
             "event applied without projection change",
@@ -646,6 +703,35 @@ def local_origin_counts(conn: sqlite3.Connection) -> dict[str, int]:
             "SELECT origin_node, COUNT(*) FROM oplog GROUP BY origin_node"
         )
     }
+
+
+# mesh_meta key holding the cutoff of the most recent oplog compaction. Events
+# at/below it were deleted locally, so anti-entropy must never re-pull them --
+# a peer still holding them would otherwise re-feed (and re-project) purged
+# history on the next gossip round.
+COMPACTION_WATERMARK_KEY = "compaction_watermark"
+
+
+def compaction_watermark(conn: sqlite3.Connection) -> str | None:
+    try:
+        row = conn.execute(
+            "SELECT value FROM mesh_meta WHERE key = ?", (COMPACTION_WATERMARK_KEY,)
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None
+    return row[0] if row else None
+
+
+def record_compaction_watermark(conn: sqlite3.Connection, cutoff: str) -> None:
+    # Advance-only: loosening retention later must not move the watermark back
+    # and re-open the door to already-purged events. ISO-8601 UTC strings
+    # compare chronologically, so a string comparison is exact here.
+    conn.execute(
+        """INSERT INTO mesh_meta(key, value) VALUES (?, ?)
+           ON CONFLICT(key) DO UPDATE SET value = excluded.value
+           WHERE excluded.value > mesh_meta.value""",
+        (COMPACTION_WATERMARK_KEY, cutoff),
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -873,11 +959,18 @@ def _make_mesh_handler(cfg: dict, registry: _PeerRegistry, app_version: str,
                 if not self._require_mesh_id(params.get("mesh_id")):
                     return
                 origin = params.get("origin", "")
+                # `since` (compaction watermark) lets the requester skip event
+                # ids it has already purged by retention, so a peer holding
+                # them cannot resurrect deleted history.
+                since = params.get("since")
+                sql = "SELECT event_id FROM oplog WHERE origin_node = ?"
+                bind = [origin]
+                if since:
+                    sql += " AND created_at > ?"
+                    bind.append(since)
+                sql += " ORDER BY lamport"
                 with _db(db_path) as conn:
-                    ids = [r[0] for r in conn.execute(
-                        "SELECT event_id FROM oplog WHERE origin_node = ? ORDER BY lamport",
-                        (origin,),
-                    )]
+                    ids = [r[0] for r in conn.execute(sql, bind)]
                 self._send_json({"origin": origin, "ids": ids})
             else:
                 self._send_json({"error": "not found"}, status=404)
@@ -1025,12 +1118,14 @@ def sync_with_peer(cfg: dict, peer: str) -> int:
             remote = _get_json(peer, _mesh_path("/mesh/digest", cfg["mesh_id"]))
             with _db() as conn:
                 local_counts = local_origin_counts(conn)
+                watermark = compaction_watermark(conn)
             applied = 0
             for origin, remote_count in (remote.get("origins") or {}).items():
                 if local_counts.get(origin, 0) >= remote_count:
                     continue
                 remote_ids = _get_json(
-                    peer, _mesh_path("/mesh/event-ids", cfg["mesh_id"], origin=origin)
+                    peer,
+                    _mesh_path("/mesh/event-ids", cfg["mesh_id"], origin=origin, since=watermark),
                 ).get("ids", [])
                 with _db() as conn:
                     have = {
@@ -1990,6 +2085,9 @@ def compact_oplog(cfg: dict | None = None, db_path: Path | None = None, dry_run:
         if delete_ids:
             placeholders = ",".join("?" for _ in delete_ids)
             conn.execute(f"DELETE FROM oplog WHERE event_id IN ({placeholders})", delete_ids)
+            # Advance the watermark so peers still holding the deleted events
+            # cannot re-feed them (deleted history must stay deleted).
+            record_compaction_watermark(conn, cutoff)
             conn.commit()
         return {"deleted": len(delete_ids), "kept": len(rows) - len(delete_ids), "dry_run": False, "retention_days": retention_days}
 

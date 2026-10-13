@@ -8,11 +8,13 @@ worth a sweep"). Revisit these later.
       all locally-served content, so risk is low, but sanitizing the markdown
       renderer output or using `textContent` for the dynamic bits would tidy
       it up.
-- [ ] **Loopback API origin check** — `/shutdown`, `/mesh/api/*`,
+- [x] **Loopback API origin check** — `/shutdown`, `/mesh/api/*`,
       `/api/preferences`, and `GET /drachometer.db` on `127.0.0.1:9873` do no
       `Origin`/`Host` validation, so a malicious web page could CSRF/
       DNS-rebind a browser into POSTing `/shutdown` or re-pointing the mesh.
-      A `Host`-header allowlist (~5 lines) closes this.
+      A `Host`-header allowlist (~5 lines) closes this. *(Done: Host
+      allowlist on all requests plus same-origin evidence required on POSTs
+      and the DB download; non-browser callers send `Origin`.)*
 - [ ] **`mock-anthropic-api.py` polish** — binds `0.0.0.0:8787` unauthenticated
       (should be `127.0.0.1`); duplicate imports; two dead
       `if tool_name: import subprocess` blocks; stale "Claude 3.5 Sonnet"
@@ -22,10 +24,12 @@ worth a sweep"). Revisit these later.
       `python_exe` parameter.
 - [ ] **`.video_agent/` at repo root** — tool droppings committed to the repo;
       add to `.gitignore` and remove.
-- [ ] **`merge_settings` crash on corrupt settings.json** — the installer's
+- [x] **`merge_settings` crash on corrupt settings.json** — the installer's
       `merge_settings()` is the only JSON read without a try/except, so a
       malformed `~/.claude/settings.json` aborts the install halfway through
-      (files already copied).
+      (files already copied). *(Done: settings.json is validated before any
+      file is copied; the installer exits with a clear message and the file
+      untouched.)*
 - [ ] **Fresh-install migration stamping foot-gun** — `init_database()` marks
       all `migrations/*.sql` as applied without running them. Correct only
       because current migrations are pure backfill; a future migration with
